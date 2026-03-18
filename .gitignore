@@ -1,0 +1,31 @@
+# Logs
+*.log
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.sln
+*.swp
+*.bak
+
+# Rust
+target/
+src-tauri/target
+src-tauri/gen
+src-tauri/bin
+
+# SQLite
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Workspace / AI Agents
+.agents/
+.gemini/
+check_output.txt
+

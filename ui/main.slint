@@ -1,0 +1,320 @@
+import { StandardListView, VerticalBox, HorizontalBox, Button, ProgressIndicator, ScrollView, ListView, LineEdit } from "std-widgets.slint";
+
+export struct TrackData {
+    id: int,
+    path: string,
+    filename: string,
+    title: string,
+    artist: string,
+    album: string,
+    duration: string,
+    sample_rate: string,
+    bit_depth: string,
+    channels: string,
+}
+
+export struct FolderItem {
+    path: string,
+    name: string,
+    indent: length,
+    is-expanded: bool,
+    has-children: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "Ready-Rev: Slint Edition";
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    min-width: 800px;
+    min-height: 600px;
+    background: #1e1e1e;
+
+    callback scan-library(string);
+    callback play-track(string);
+    callback stop-track();
+    callback select-folder(string);
+    callback toggle-folder(string);
+    callback search-tracks(string);
+    callback start-drag(string);
+    callback seek-track(float);
+
+    in-out property <[TrackData]> tracks: [];
+    in-out property <[FolderItem]> folders: [];
+    in-out property <string> status-text: "Ready";
+    in-out property <float> scan-progress: 0.0;
+    in-out property <bool> is-scanning: false;
+    
+    in-out property <string> current-track-name: "-";
+    in-out property <string> current-track-info: "-";
+    in-out property <float> play-progress: 0.0;
+    in-out property <image> waveform-image: @image-url("");
+    in-out property <int> selected-index: -1;
+    in-out property <bool> is-playing: false;
+    in-out property <length> sidebar-width: 250px;
+    in-out property <string> selected-folder: "";
+
+    HorizontalLayout {
+        // Sidebar
+        VerticalLayout {
+            width: sidebar-width;
+            padding: 10px;
+            spacing: 5px;
+            
+            Text {
+                text: "Libraries";
+                color: #ffffff;
+                font-weight: 700;
+            }
+
+            Button {
+                text: "Add Library";
+                clicked => { root.scan-library(""); }
+            }
+
+            ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    for folder in folders: Rectangle {
+                        height: 25px;
+                        background: folder.path == root.selected-folder ? #2a4d7d : #2b2b2b;
+                        border-radius: 2px;
+                        
+                        HorizontalLayout {
+                            padding-left: 5px + folder.indent;
+                            padding-right: 5px;
+                            alignment: start;
+                            spacing: 5px;
+                            
+                            if folder.has-children : TouchArea {
+                                width: 16px;
+                                clicked => { root.toggle-folder(folder.path); }
+                                Text {
+                                    text: folder.is-expanded ? "v" : ">";
+                                    color: #888;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                    font-size: 10px;
+                                }
+                            }
+                            if !folder.has-children : Rectangle { width: 16px; }
+
+                            TouchArea {
+                                clicked => { root.select-folder(folder.path); }
+                                Text {
+                                    text: folder.name;
+                                    color: #ccc;
+                                    vertical-alignment: center;
+                                    font-size: 12px;
+                                    overflow: elide;
+                                }
+                            }
+                            TouchArea {
+                                width: 20px;
+                                clicked => { root.scan-library(folder.path); }
+                                Text {
+                                    text: "↺";
+                                    color: #888;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                    font-size: 14px;
+                                }
+                            }
+                        }
+                    }
+            }
+        }
+    }
+
+    // Splitter
+        Rectangle {
+            width: 3px;
+            background: #2b2b2b;
+            TouchArea {
+                mouse-cursor: MouseCursor.col-resize;
+                moved => {
+                    if (sidebar-width + self.mouse-x > 150px && sidebar-width + self.mouse-x < 500px) {
+                        sidebar-width = sidebar-width + self.mouse-x;
+                    }
+                }
+            }
+        }
+
+    // Main Panel
+        VerticalLayout {
+            padding: 10px;
+            spacing: 10px;
+
+            // Header / Search
+            HorizontalLayout {
+                height: 40px;
+                spacing: 10px;
+                Rectangle {
+                    background: #2d2d2d;
+                    border-radius: 4px;
+                    width: 200px;
+                    LineEdit {
+                        placeholder-text: "Search by name or path...";
+                        edited(text) => {
+                            root.search-tracks(text);
+                        }
+                    }
+                }
+                Text {
+                    text: "Result: " + tracks.length;
+                    color: #aaa;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Track Table Header
+            Rectangle {
+                height: 25px;
+                background: #252525;
+                HorizontalLayout {
+                    padding-left: 5px;
+                    padding-right: 5px;
+                    Text { text: "Name"; color: #888; horizontal-stretch: 1; }
+                    Text { text: "Duration"; color: #888; width: 80px; }
+                    Text { text: "BitDepth"; color: #888; width: 80px; }
+                    Text { text: "SampleRate"; color: #888; width: 100px; }
+                    Text { text: "Channels"; color: #888; width: 80px; }
+                }
+            }
+
+            // Track List (Virtualized)
+            ListView {
+                for track[i] in tracks: Rectangle {
+                    property <length> drag-start-x: 0px;
+                    property <length> drag-start-y: 0px;
+                    property <bool> drag-active: false;
+
+                    height: 35px;
+                    background: i == selected-index ? #2d3e50 : (mod(i, 2) == 0 ? #1e1e1e : #252525);
+                    
+                    // Separator line
+                    Rectangle {
+                        y: parent.height - 1px;
+                        height: 1px;
+                        background: #333;
+                    }
+                    
+                    TouchArea {
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.left) {
+                                if (event.kind == PointerEventKind.down) {
+                                    drag-start-x = self.mouse-x;
+                                    drag-start-y = self.mouse-y;
+                                    drag-active = true;
+                                } else if (event.kind == PointerEventKind.up) {
+                                    drag-active = false;
+                                }
+                            }
+                        }
+                        moved => {
+                            if (drag-active) {
+                                if (self.mouse-x - drag-start-x > 5px || drag-start-x - self.mouse-x > 5px || self.mouse-y - drag-start-y > 5px || drag-start-y - self.mouse-y > 5px) {
+                                    drag-active = false;
+                                    root.start-drag(track.path);
+                                }
+                            }
+                        }
+                        clicked => { 
+                            selected-index = i;
+                            root.play-track(track.path); 
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 5px;
+                        padding-right: 5px;
+                        spacing: 5px;
+                        
+                        Text { text: track.filename; color: i == selected-index ? #fff : #eee; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        Text { text: track.duration; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
+                        Text { text: track.bit_depth; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
+                        Text { text: track.sample_rate; color: i == selected-index ? #fff : #aaa; width: 100px; vertical-alignment: center; }
+                        Text { text: track.channels; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // Bottom Player Area
+            Rectangle {
+                height: 160px;
+                background: #111;
+                border-radius: 8px;
+                
+                VerticalLayout {
+                    padding: 15px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        spacing: 20px;
+                        alignment: start;
+                        Button {
+                            text: is-playing ? "Stop" : "Play";
+                            width: 100px;
+                            clicked => {
+                                if (is-playing) { root.stop-track(); }
+                                // Play logic is usually triggered by selecting a track in this version
+                            }
+                        }
+                        
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: root.current-track-name;
+                                color: #fff;
+                                font-size: 16px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: root.current-track-info;
+                                color: #888;
+                                font-size: 11px;
+                                overflow: elide;
+                            }
+                        }
+                    }
+
+                    // Waveform Display
+                    Rectangle {
+                        height: 70px;
+                        background: #000;
+                        border-radius: 4px;
+                        clip: true;
+                        
+                        Image {
+                            source: root.waveform-image;
+                            width: 100%;
+                            height: 100%;
+                            image-fit: fill;
+                        }
+                        
+                        // Progress overlay
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * root.play-progress;
+                            background: #ff5500;
+                            opacity: 0.3;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.seek-track(self.mouse-x / self.width);
+                            }
+                        }
+                    }
+                    
+                    if is-scanning : HorizontalLayout {
+                        spacing: 10px;
+                        ProgressIndicator {
+                            progress: scan-progress;
+                            width: 200px;
+                        }
+                        Text { text: "Status: " + status-text; font-size: 11px; color: #aaa; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,37 @@
+[package]
+name = "sampleman"
+version = "0.1.0"
+description = "Ready-Rev: Modern Music Library Manager"
+authors = ["you"]
+edition = "2021"
+
+[build-dependencies]
+slint-build = "=1.7.0"
+
+[dependencies]
+slint = { version = "=1.7.0", features = ["backend-winit", "renderer-software"] }
+tokio = { version = "1.37", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+symphonia = { version = "0.5.2", features = ["all"] }
+walkdir = "2.5"
+chrono = "0.4"
+base64 = "0.22"
+anyhow = "1.0"
+rodio = "0.19"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+rfd = "0.14"
+drag = "2.1.0"
+raw-window-handle = "0.6"
+winit = { version = "0.30.13", features = ["rwh_06"] }
+i-slint-backend-winit = "1.7.0"
+
+[profile.release]
+panic = "abort" # Strip expensive panic info
+codegen-units = 1 # Better optimizations
+lto = true # Link time optimization
+opt-level = "s" # Optimize for size
+strip = true # Strip symbols from the binary
+
