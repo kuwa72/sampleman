@@ -447,6 +447,31 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
+    ui.on_open_in_file_manager(move |path| {
+        let path_str = path.to_string();
+        let p = std::path::PathBuf::from(&path_str);
+        
+        #[cfg(target_os = "windows")]
+        {
+            if p.is_file() {
+                let _ = std::process::Command::new("explorer")
+                    .arg("/select,")
+                    .arg(&p)
+                    .spawn();
+            } else {
+                let _ = std::process::Command::new("explorer")
+                    .arg(&p)
+                    .spawn();
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let target = if p.is_file() { p.parent().unwrap_or(&p) } else { &p };
+            let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+            let _ = std::process::Command::new(cmd).arg(target).spawn();
+        }
+    });
+
     ui.run()?;
     Ok(())
 }

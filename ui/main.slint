@@ -37,6 +37,8 @@ export component AppWindow inherits Window {
     callback search-tracks(string);
     callback start-drag(string);
     callback seek-track(float);
+    callback open-in-file-manager(string);
+
 
     in-out property <[TrackData]> tracks: [];
     in-out property <[FolderItem]> folders: [];
@@ -119,6 +121,18 @@ export component AppWindow inherits Window {
                                     font-size: 14px;
                                 }
                             }
+                            TouchArea {
+                                width: 20px;
+                                clicked => { root.open-in-file-manager(folder.path); }
+                                Text {
+                                    text: "📂";
+                                    color: #888;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                    font-size: 14px;
+                                }
+                            }
+
                         }
                     }
             }
@@ -259,6 +273,12 @@ export component AppWindow inherits Window {
                                 // Play logic is usually triggered by selecting a track in this version
                             }
                         }
+                        if root.selected-index >= 0 : Button {
+                            text: "Show Folder";
+                            width: 110px;
+                            clicked => { root.open-in-file-manager(root.tracks[root.selected-index].path); }
+                        }
+
                         
                         VerticalLayout {
                             alignment: center;
