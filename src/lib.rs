@@ -9,6 +9,7 @@ use rodio::{OutputStream, Sink};
 use slint::{ComponentHandle, SharedString, VecModel, ModelRc, Image, SharedPixelBuffer, Rgba8Pixel};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use chrono::{TimeZone, Local};
 
 slint::include_modules!();
 
@@ -24,6 +25,8 @@ struct UiState {
     search_query: String,
     selected_folder: String,
     all_tracks: Vec<Track>, // Cached tracks in memory
+    sort_column: String,
+    sort_asc: bool,
 }
 
 fn map_track_to_slint(t: &Track) -> TrackData {
@@ -31,6 +34,9 @@ fn map_track_to_slint(t: &Track) -> TrackData {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| t.path.clone());
+
+    let datetime = Local.timestamp_opt(t.mtime, 0).unwrap();
+    let mtime_str = datetime.format("%Y-%m-%d %H:%M").to_string();
 
     TrackData {
         id: t.id as i32,
@@ -43,6 +49,7 @@ fn map_track_to_slint(t: &Track) -> TrackData {
         sample_rate: SharedString::from(t.sample_rate.map(|s| format!("{}Hz", s)).unwrap_or_else(|| "-".into())),
         bit_depth: SharedString::from(t.bit_depth.map(|s| format!("{}bit", s)).unwrap_or_else(|| "-".into())),
         channels: SharedString::from(t.channels.map(|s| format!("{}ch", s)).unwrap_or_else(|| "-".into())),
+        mtime: SharedString::from(mtime_str),
     }
 }
 
@@ -60,7 +67,11 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
     }
     
     let mut sorted_paths: Vec<_> = all_paths.iter().collect();
-    sorted_paths.sort();
+    sorted_paths.sort_by(|a, b| {
+        let a_str = a.to_string_lossy().to_lowercase();
+        let b_str = b.to_string_lossy().to_lowercase();
+        a_str.cmp(&b_str)
+    });
 
     let mut items = Vec::new();
     for p in sorted_paths {
@@ -100,8 +111,8 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
     items
 }
 
-fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str) -> Vec<TrackData> {
-    tracks.iter()
+fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<TrackData> {
+    let mut filtered: Vec<_> = tracks.iter()
         .filter(|t| folder.is_empty() || t.path.starts_with(folder))
         .filter(|t| {
             if query.is_empty() { return true; }
@@ -110,8 +121,26 @@ fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str) -> Vec<Track
             t.path.to_lowercase().contains(&q) || name.contains(&q) || 
             t.title.as_ref().map(|x| x.to_lowercase().contains(&q)).unwrap_or(false)
         })
-        .map(|t| map_track_to_slint(t))
-        .collect()
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        let res = match sort_column {
+            "name" => {
+                let a_name = Path::new(&a.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let b_name = Path::new(&b.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                a_name.cmp(&b_name)
+            }
+            "duration" => a.duration.partial_cmp(&b.duration).unwrap_or(std::cmp::Ordering::Equal),
+            "bit_depth" => a.bit_depth.unwrap_or(0).cmp(&b.bit_depth.unwrap_or(0)),
+            "sample_rate" => a.sample_rate.unwrap_or(0).cmp(&b.sample_rate.unwrap_or(0)),
+            "channels" => a.channels.unwrap_or(0).cmp(&b.channels.unwrap_or(0)),
+            "mtime" => a.mtime.cmp(&b.mtime),
+            _ => std::cmp::Ordering::Equal,
+        };
+        if sort_asc { res } else { res.reverse() }
+    });
+
+    filtered.into_iter().map(|t| map_track_to_slint(t)).collect()
 }
 
 fn create_waveform_pixels(waveform: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -180,6 +209,8 @@ pub fn run() -> anyhow::Result<()> {
         search_query: String::new(),
         selected_folder: String::new(),
         all_tracks: initial_tracks,
+        sort_column: String::from("name"),
+        sort_asc: true,
     }));
 
     let timer = slint::Timer::default();
@@ -206,7 +237,7 @@ pub fn run() -> anyhow::Result<()> {
         let folder_items = extract_folders_hierarchical(&ui_state_guard.all_tracks, &ui_state_guard.expanded_folders);
         ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
 
-        let track_data = get_filtered_tracks(&ui_state_guard.all_tracks, &ui_state_guard.selected_folder, &ui_state_guard.search_query);
+        let track_data = get_filtered_tracks(&ui_state_guard.all_tracks, &ui_state_guard.selected_folder, &ui_state_guard.search_query, &ui_state_guard.sort_column, ui_state_guard.sort_asc);
         ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
         ui.set_selected_index(-1);
     }
@@ -265,7 +296,7 @@ pub fn run() -> anyhow::Result<()> {
                 let mut st = ui_state.lock().unwrap();
                 st.all_tracks = tracks.clone(); // Update cache!
                 let folder_items = extract_folders_hierarchical(&tracks, &st.expanded_folders);
-                let track_data = get_filtered_tracks(&tracks, &st.selected_folder, &st.search_query);
+                let track_data = get_filtered_tracks(&tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
                 
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
@@ -298,7 +329,7 @@ pub fn run() -> anyhow::Result<()> {
 
         std::thread::spawn(move || {
             let st = ui_state.lock().unwrap();
-            let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query);
+            let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
             
             slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
@@ -334,7 +365,7 @@ pub fn run() -> anyhow::Result<()> {
         let mut st = ui_state_search.lock().unwrap();
         st.search_query = query.to_string();
 
-        let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query);
+        let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
         if let Some(ui) = ui_handle_search.upgrade() {
             ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
             ui.set_selected_index(-1);
@@ -385,11 +416,23 @@ pub fn run() -> anyhow::Result<()> {
                 }
 
                 let (seek_tx, seek_rx) = crossbeam_channel::unbounded::<f64>();
-                let source = match crate::audio::SymphoniaSource::new(&path_str, seek_rx) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Failed to create SymphoniaSource: {}", e);
-                        return;
+                let ext = Path::new(&path_str).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                
+                let source = if ext == "mid" || ext == "midi" {
+                    match crate::audio::MidiSource::new(&path_str, seek_rx) {
+                        Ok(s) => crate::audio::DynamicSource::Midi(s),
+                        Err(e) => {
+                            eprintln!("Failed to create MidiSource: {}", e);
+                            return;
+                        }
+                    }
+                } else {
+                    match crate::audio::SymphoniaSource::new(&path_str, seek_rx) {
+                        Ok(s) => crate::audio::DynamicSource::Symphonia(s),
+                        Err(e) => {
+                            eprintln!("Failed to create SymphoniaSource: {}", e);
+                            return;
+                        }
                     }
                 };
 
@@ -469,6 +512,34 @@ pub fn run() -> anyhow::Result<()> {
             let target = if p.is_file() { p.parent().unwrap_or(&p) } else { &p };
             let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
             let _ = std::process::Command::new(cmd).arg(target).spawn();
+        }
+    });
+
+    let state_sort = state.clone();
+    let ui_handle_sort = ui_weak.clone();
+    let ui_state_sort = ui_state.clone();
+    ui.on_sort_tracks(move |column| {
+        let mut st = ui_state_sort.lock().unwrap();
+        let col_str = column.to_string();
+        if st.sort_column == col_str {
+            st.sort_asc = !st.sort_asc;
+        } else {
+            st.sort_column = col_str;
+            st.sort_asc = true;
+        }
+        
+        let asc = st.sort_asc;
+        let col = st.sort_column.clone();
+        
+        if let Some(ui) = ui_handle_sort.upgrade() {
+            ui.set_current_sort_column(SharedString::from(&col));
+            ui.set_current_sort_asc(asc);
+        }
+
+        let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
+        if let Some(ui) = ui_handle_sort.upgrade() {
+            ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
+            ui.set_selected_index(-1);
         }
     });
 

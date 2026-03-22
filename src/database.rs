@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub struct Track {
     pub id: i64,
     pub path: String,
+    pub mtime: i64, // Added
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -192,15 +193,16 @@ impl Database {
         Ok(Track {
             id: row.get(0)?,
             path: row.get(1)?,
-            title: row.get(2)?,
-            artist: row.get(3)?,
-            album: row.get(4)?,
-            genre: row.get(5)?,
-            duration: row.get(6)?,
-            sample_rate: row.get(7)?,
-            bit_depth: row.get(8)?,
-            channels: row.get(9)?,
-            comment: row.get(10)?,
+            mtime: row.get(2)?,
+            title: row.get(3)?,
+            artist: row.get(4)?,
+            album: row.get(5)?,
+            genre: row.get(6)?,
+            duration: row.get(7)?,
+            sample_rate: row.get(8)?,
+            bit_depth: row.get(9)?,
+            channels: row.get(10)?,
+            comment: row.get(11)?,
             waveform: None,
         })
     }
@@ -209,21 +211,22 @@ impl Database {
         Ok(Track {
             id: row.get(0)?,
             path: row.get(1)?,
-            title: row.get(2)?,
-            artist: row.get(3)?,
-            album: row.get(4)?,
-            genre: row.get(5)?,
-            duration: row.get(6)?,
-            sample_rate: row.get(7)?,
-            bit_depth: row.get(8)?,
-            channels: row.get(9)?,
-            comment: row.get(10)?,
-            waveform: row.get(11)?,
+            mtime: row.get(2)?,
+            title: row.get(3)?,
+            artist: row.get(4)?,
+            album: row.get(5)?,
+            genre: row.get(6)?,
+            duration: row.get(7)?,
+            sample_rate: row.get(8)?,
+            bit_depth: row.get(9)?,
+            channels: row.get(10)?,
+            comment: row.get(11)?,
+            waveform: row.get(12)?,
         })
     }
 
     pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform FROM tracks WHERE path = ?")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform FROM tracks WHERE path = ?")?;
         let mut rows = stmt.query_map([path], |row| self.row_to_track(row))?;
 
         if let Some(track_res) = rows.next() {
@@ -233,7 +236,7 @@ impl Database {
     }
 
     pub fn get_all_tracks(&self) -> Result<Vec<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment FROM tracks")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment FROM tracks")?;
         let track_iter = stmt.query_map([], |row| self.row_to_track_no_waveform(row))?;
 
         let mut tracks = Vec::new();

@@ -11,6 +11,7 @@ export struct TrackData {
     sample_rate: string,
     bit_depth: string,
     channels: string,
+    mtime: string,
 }
 
 export struct FolderItem {
@@ -38,6 +39,7 @@ export component AppWindow inherits Window {
     callback start-drag(string);
     callback seek-track(float);
     callback open-in-file-manager(string);
+    callback sort-tracks(string);
 
 
     in-out property <[TrackData]> tracks: [];
@@ -54,6 +56,8 @@ export component AppWindow inherits Window {
     in-out property <bool> is-playing: false;
     in-out property <length> sidebar-width: 250px;
     in-out property <string> selected-folder: "";
+    in-out property <string> current-sort-column: "name";
+    in-out property <bool> current-sort-asc: true;
 
     HorizontalLayout {
         // Sidebar
@@ -187,11 +191,62 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     padding-left: 5px;
                     padding-right: 5px;
-                    Text { text: "Name"; color: #888; horizontal-stretch: 1; }
-                    Text { text: "Duration"; color: #888; width: 80px; }
-                    Text { text: "BitDepth"; color: #888; width: 80px; }
-                    Text { text: "SampleRate"; color: #888; width: 100px; }
-                    Text { text: "Channels"; color: #888; width: 80px; }
+                    spacing: 5px;
+                    
+                    TouchArea {
+                        horizontal-stretch: 1;
+                        clicked => { root.sort-tracks("name"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "Name"; color: #888; }
+                            if root.current-sort-column == "name" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 120px;
+                        clicked => { root.sort-tracks("mtime"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "Updated"; color: #888; }
+                            if root.current-sort-column == "mtime" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 80px;
+                        clicked => { root.sort-tracks("duration"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "Duration"; color: #888; }
+                            if root.current-sort-column == "duration" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 80px;
+                        clicked => { root.sort-tracks("bit_depth"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "BitDepth"; color: #888; }
+                            if root.current-sort-column == "bit_depth" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 100px;
+                        clicked => { root.sort-tracks("sample_rate"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "SampleRate"; color: #888; }
+                            if root.current-sort-column == "sample_rate" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 80px;
+                        clicked => { root.sort-tracks("channels"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "Channels"; color: #888; }
+                            if root.current-sort-column == "channels" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
                 }
             }
 
@@ -244,6 +299,7 @@ export component AppWindow inherits Window {
                         spacing: 5px;
                         
                         Text { text: track.filename; color: i == selected-index ? #fff : #eee; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                        Text { text: track.mtime; color: i == selected-index ? #fff : #aaa; width: 120px; vertical-alignment: center; }
                         Text { text: track.duration; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
                         Text { text: track.bit_depth; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
                         Text { text: track.sample_rate; color: i == selected-index ? #fff : #aaa; width: 100px; vertical-alignment: center; }

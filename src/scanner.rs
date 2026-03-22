@@ -169,20 +169,42 @@ impl<'a> Scanner<'a> {
         }
 
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        matches!(ext.as_str(), "wav" | "mp3" | "aif" | "aiff" | "m4a" | "ogg" | "wma")
+        matches!(ext.as_str(), "wav" | "mp3" | "aif" | "aiff" | "m4a" | "ogg" | "wma" | "mid" | "midi")
     }
 
 
     fn analyze_file(&self, path: &Path, path_str: &str, mtime: i64, size: i64) -> anyhow::Result<TrackData> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        
+        if ext == "mid" || ext == "midi" {
+            let mut file = fs::File::open(path)?;
+            let midi = rustysynth::MidiFile::new(&mut file).map_err(|e| anyhow::anyhow!("MIDI parse error: {:?}", e))?;
+            let duration = midi.get_length();
+            
+            return Ok(TrackData {
+                path: path_str.to_string(),
+                mtime,
+                size,
+                title: None,
+                artist: None,
+                album: None,
+                genre: None,
+                duration,
+                sample_rate: Some(44100), // Default synth rate
+                bit_depth: Some(16),
+                channels: Some(2),
+                comment: None,
+                waveform: Some(Vec::new()), // Empty waveform
+            });
+        }
+
         // Open the media source
         let file = fs::File::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
         // Create a hint to help the format reader
         let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            hint.with_extension(ext);
-        }
+        hint.with_extension(&ext);
 
         // Use default options
         let format_opts = FormatOptions::default();
