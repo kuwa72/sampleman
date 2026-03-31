@@ -103,8 +103,10 @@ impl Iterator for SymphoniaSource {
                 Ok(decoded) => {
                     let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
                     buf.copy_interleaved_ref(decoded);
-                    self.sample_buf = Some(buf);
-                    break;
+                    if !buf.samples().is_empty() {
+                        self.sample_buf = Some(buf);
+                        break;
+                    }
                 }
                 Err(Error::DecodeError(_)) => continue,
                 Err(e) => {

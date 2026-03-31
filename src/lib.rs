@@ -10,6 +10,8 @@ use slint::{ComponentHandle, SharedString, VecModel, ModelRc, Image, SharedPixel
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use chrono::{TimeZone, Local};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 
 slint::include_modules!();
 
@@ -27,6 +29,7 @@ struct UiState {
     all_tracks: Vec<Track>, // Cached tracks in memory
     sort_column: String,
     sort_asc: bool,
+    folder_search_query: String, // Added
 }
 
 fn map_track_to_slint(t: &Track) -> TrackData {
@@ -53,7 +56,7 @@ fn map_track_to_slint(t: &Track) -> TrackData {
     }
 }
 
-fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) -> Vec<FolderItem> {
+fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, folder_query: &str) -> Vec<FolderItem> {
     let mut all_paths = HashSet::new();
     for t in tracks {
         let mut p = PathBuf::from(&t.path);
@@ -66,6 +69,22 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
         }
     }
     
+    let matcher = SkimMatcherV2::default();
+    let mut visible_paths = HashSet::new();
+
+    if !folder_query.is_empty() {
+        for p in &all_paths {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if matcher.fuzzy_match(&name, folder_query).unwrap_or(0) > 0 {
+                let mut curr = p.clone();
+                while !curr.as_os_str().is_empty() && curr.parent().is_some() {
+                    visible_paths.insert(curr.clone());
+                    curr = curr.parent().unwrap().to_path_buf();
+                }
+            }
+        }
+    }
+
     let mut sorted_paths: Vec<_> = all_paths.iter().collect();
     sorted_paths.sort_by(|a, b| {
         let a_str = a.to_string_lossy().to_lowercase();
@@ -75,17 +94,24 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
 
     let mut items = Vec::new();
     for p in sorted_paths {
+        if !folder_query.is_empty() && !visible_paths.contains(p) {
+            continue;
+        }
+
         let mut parent = p.parent();
         let mut visible = true;
-        while let Some(par) = parent {
-            if par.as_os_str().is_empty() || par.parent().is_none() {
-                break;
+        
+        if folder_query.is_empty() {
+            while let Some(par) = parent {
+                if par.as_os_str().is_empty() || par.parent().is_none() {
+                    break;
+                }
+                if !expanded.contains(&par.to_string_lossy().to_string()) {
+                    visible = false;
+                    break;
+                }
+                parent = par.parent();
             }
-            if !expanded.contains(&par.to_string_lossy().to_string()) {
-                visible = false;
-                break;
-            }
-            parent = par.parent();
         }
 
         if !visible {
@@ -104,7 +130,7 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
             path: path_str.clone().into(),
             name: name.into(),
             indent,
-            is_expanded: expanded.contains(&path_str),
+            is_expanded: if !folder_query.is_empty() { true } else { expanded.contains(&path_str) },
             has_children,
         });
     }
@@ -112,35 +138,61 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>) ->
 }
 
 fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<TrackData> {
-    let mut filtered: Vec<_> = tracks.iter()
+    let matcher = SkimMatcherV2::default();
+    
+    let mut filtered: Vec<(&Track, i64)> = tracks.iter()
         .filter(|t| folder.is_empty() || t.path.starts_with(folder))
-        .filter(|t| {
-            if query.is_empty() { return true; }
-            let q = query.to_lowercase();
-            let name = Path::new(&t.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-            t.path.to_lowercase().contains(&q) || name.contains(&q) || 
-            t.title.as_ref().map(|x| x.to_lowercase().contains(&q)).unwrap_or(false)
+        .filter_map(|t| {
+            if query.is_empty() {
+                return Some((t, 0));
+            }
+            
+            let filename = Path::new(&t.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let score_fn = matcher.fuzzy_match(&filename, query).unwrap_or(0);
+            
+            let score_title = if let Some(ref title) = t.title {
+                matcher.fuzzy_match(title, query).unwrap_or(0)
+            } else { 0 };
+            
+            let score_path = matcher.fuzzy_match(&t.path, query).unwrap_or(0);
+            let max_score = score_fn.max(score_title).max(score_path);
+            
+            if max_score > 0 {
+                Some((t, max_score))
+            } else {
+                None
+            }
         })
         .collect();
 
     filtered.sort_by(|a, b| {
+        let (at, a_score) = a;
+        let (bt, b_score) = b;
+        
+        if !query.is_empty() && sort_column == "name" {
+            let s_cmp = b_score.cmp(a_score); // Score DESC
+            if s_cmp != std::cmp::Ordering::Equal {
+                return s_cmp;
+            }
+        }
+        
         let res = match sort_column {
             "name" => {
-                let a_name = Path::new(&a.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let b_name = Path::new(&b.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let a_name = Path::new(&at.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let b_name = Path::new(&bt.path).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
                 a_name.cmp(&b_name)
             }
-            "duration" => a.duration.partial_cmp(&b.duration).unwrap_or(std::cmp::Ordering::Equal),
-            "bit_depth" => a.bit_depth.unwrap_or(0).cmp(&b.bit_depth.unwrap_or(0)),
-            "sample_rate" => a.sample_rate.unwrap_or(0).cmp(&b.sample_rate.unwrap_or(0)),
-            "channels" => a.channels.unwrap_or(0).cmp(&b.channels.unwrap_or(0)),
-            "mtime" => a.mtime.cmp(&b.mtime),
+            "duration" => at.duration.partial_cmp(&bt.duration).unwrap_or(std::cmp::Ordering::Equal),
+            "bit_depth" => at.bit_depth.unwrap_or(0).cmp(&bt.bit_depth.unwrap_or(0)),
+            "sample_rate" => at.sample_rate.unwrap_or(0).cmp(&bt.sample_rate.unwrap_or(0)),
+            "channels" => at.channels.unwrap_or(0).cmp(&bt.channels.unwrap_or(0)),
+            "mtime" => at.mtime.cmp(&bt.mtime),
             _ => std::cmp::Ordering::Equal,
         };
         if sort_asc { res } else { res.reverse() }
     });
 
-    filtered.into_iter().map(|t| map_track_to_slint(t)).collect()
+    filtered.into_iter().map(|(t, _)| map_track_to_slint(t)).collect()
 }
 
 fn create_waveform_pixels(waveform: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -199,18 +251,24 @@ pub fn run() -> anyhow::Result<()> {
         seek_tx: Arc::new(Mutex::new(None)),
     });
 
-    let initial_tracks = {
+    let (initial_tracks, saved_folder, saved_col, saved_asc) = {
         let db_lock = db.lock().unwrap();
-        db_lock.get_all_tracks().unwrap_or_default()
+        let tracks = db_lock.get_all_tracks().unwrap_or_default();
+        let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
+        let col = db_lock.get_setting("sort_column").unwrap_or_default().unwrap_or_else(|| String::from("name"));
+        let asc_str = db_lock.get_setting("sort_asc").unwrap_or_default().unwrap_or_else(|| String::from("true"));
+        let asc = asc_str == "true";
+        (tracks, folder, col, asc)
     };
 
     let ui_state = Arc::new(Mutex::new(UiState {
         expanded_folders: HashSet::new(),
         search_query: String::new(),
-        selected_folder: String::new(),
+        selected_folder: saved_folder,
         all_tracks: initial_tracks,
-        sort_column: String::from("name"),
-        sort_asc: true,
+        sort_column: saved_col,
+        sort_asc: saved_asc,
+        folder_search_query: String::new(),
     }));
 
     let timer = slint::Timer::default();
@@ -234,7 +292,11 @@ pub fn run() -> anyhow::Result<()> {
 
     {
         let ui_state_guard = ui_state.lock().unwrap();
-        let folder_items = extract_folders_hierarchical(&ui_state_guard.all_tracks, &ui_state_guard.expanded_folders);
+        ui.set_selected_folder(SharedString::from(&ui_state_guard.selected_folder));
+        ui.set_current_sort_column(SharedString::from(&ui_state_guard.sort_column));
+        ui.set_current_sort_asc(ui_state_guard.sort_asc);
+
+        let folder_items = extract_folders_hierarchical(&ui_state_guard.all_tracks, &ui_state_guard.expanded_folders, &ui_state_guard.folder_search_query);
         ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
 
         let track_data = get_filtered_tracks(&ui_state_guard.all_tracks, &ui_state_guard.selected_folder, &ui_state_guard.search_query, &ui_state_guard.sort_column, ui_state_guard.sort_asc);
@@ -295,7 +357,7 @@ pub fn run() -> anyhow::Result<()> {
                 
                 let mut st = ui_state.lock().unwrap();
                 st.all_tracks = tracks.clone(); // Update cache!
-                let folder_items = extract_folders_hierarchical(&tracks, &st.expanded_folders);
+                let folder_items = extract_folders_hierarchical(&tracks, &st.expanded_folders, &st.folder_search_query);
                 let track_data = get_filtered_tracks(&tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
                 
                 slint::invoke_from_event_loop(move || {
@@ -322,6 +384,13 @@ pub fn run() -> anyhow::Result<()> {
         if let Some(ui) = ui_handle_filter.upgrade() {
             ui.set_selected_folder(SharedString::from(&path_str));
         }
+
+        let db = state_filter.db.clone();
+        let path_for_db = path_str.clone();
+        std::thread::spawn(move || {
+            let db_lock = db.lock().unwrap();
+            let _ = db_lock.set_setting("selected_folder", &path_for_db);
+        });
 
         let state = state_filter.clone();
         let ui_weak = ui_handle_filter.clone();
@@ -352,7 +421,7 @@ pub fn run() -> anyhow::Result<()> {
             st.expanded_folders.insert(path_str);
         }
 
-        let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders);
+        let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
         if let Some(ui) = ui_handle_toggle.upgrade() {
             ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
         }
@@ -374,10 +443,43 @@ pub fn run() -> anyhow::Result<()> {
 
     let state_play = state.clone();
     let ui_handle_play = ui_weak.clone();
+    let ui_state_play = ui_state.clone();
     ui.on_play_track(move |path| {
         let state = state_play.clone();
         let ui_handle = ui_handle_play.clone();
         let path_str = path.to_string();
+
+        {
+            let mut st = ui_state_play.lock().unwrap();
+            let p = PathBuf::from(&path_str);
+            if let Some(parent) = p.parent() {
+                let parent_str = parent.to_string_lossy().to_string();
+                if !parent_str.is_empty() {
+                    st.selected_folder = parent_str.clone();
+                    
+                    let mut curr = parent.to_path_buf();
+                    while let Some(par) = curr.parent() {
+                        if par.as_os_str().is_empty() || par.parent().is_none() {
+                            break;
+                        }
+                        st.expanded_folders.insert(par.to_string_lossy().to_string());
+                        curr = par.to_path_buf();
+                    }
+                    st.expanded_folders.insert(parent_str.clone());
+                    
+                    let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
+                    let sel_f = st.selected_folder.clone();
+                    
+                    let ui_weak = ui_handle.clone();
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
+                            ui.set_selected_folder(SharedString::from(sel_f));
+                        }
+                    }).ok();
+                }
+            }
+        }
 
         std::thread::spawn(move || {
             let track = {
@@ -531,6 +633,14 @@ pub fn run() -> anyhow::Result<()> {
         let asc = st.sort_asc;
         let col = st.sort_column.clone();
         
+        let db = state_sort.db.clone();
+        let col_for_db = col.clone();
+        std::thread::spawn(move || {
+            let db_lock = db.lock().unwrap();
+            let _ = db_lock.set_setting("sort_column", &col_for_db);
+            let _ = db_lock.set_setting("sort_asc", if asc { "true" } else { "false" });
+        });
+
         if let Some(ui) = ui_handle_sort.upgrade() {
             ui.set_current_sort_column(SharedString::from(&col));
             ui.set_current_sort_asc(asc);
@@ -540,6 +650,18 @@ pub fn run() -> anyhow::Result<()> {
         if let Some(ui) = ui_handle_sort.upgrade() {
             ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
             ui.set_selected_index(-1);
+        }
+    });
+
+    let ui_state_folder_search = ui_state.clone();
+    let ui_handle_folder_search = ui_weak.clone();
+    ui.on_search_folders(move |query| {
+        let mut st = ui_state_folder_search.lock().unwrap();
+        st.folder_search_query = query.to_string();
+
+        let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
+        if let Some(ui) = ui_handle_folder_search.upgrade() {
+            ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
         }
     });
 

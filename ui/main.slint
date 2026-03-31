@@ -40,6 +40,7 @@ export component AppWindow inherits Window {
     callback seek-track(float);
     callback open-in-file-manager(string);
     callback sort-tracks(string);
+    callback search-folders(string);
 
 
     in-out property <[TrackData]> tracks: [];
@@ -77,6 +78,18 @@ export component AppWindow inherits Window {
                 clicked => { root.scan-library(""); }
             }
 
+            Rectangle {
+                background: #2d2d2d;
+                border-radius: 4px;
+                height: 25px;
+                LineEdit {
+                    placeholder-text: "Filter folders...";
+                    edited(text) => {
+                        root.search-folders(text);
+                    }
+                }
+            }
+            
             ScrollView {
                 VerticalLayout {
                     alignment: start;
