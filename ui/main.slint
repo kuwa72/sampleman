@@ -31,7 +31,7 @@ export component AppWindow inherits Window {
     background: #1e1e1e;
 
     callback scan-library(string);
-    callback play-track(string);
+    callback play-track(string, float);
     callback stop-track();
     callback select-folder(string);
     callback toggle-folder(string);
@@ -60,7 +60,42 @@ export component AppWindow inherits Window {
     in-out property <string> current-sort-column: "name";
     in-out property <bool> current-sort-asc: true;
 
-    HorizontalLayout {
+    forward-focus: main-focus;
+
+    main-focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == " ") {
+                if (root.is-playing) {
+                    root.stop-track();
+                } else if (root.selected-index >= 0 && root.selected-index < root.tracks.length) {
+                    root.play-track(root.tracks[root.selected-index].path, 0.0);
+                }
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                if (root.selected-index > 0) {
+                    root.selected-index -= 1;
+                } else if (root.selected-index == -1 && root.tracks.length > 0) {
+                    root.selected-index = 0;
+                }
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                if (root.selected-index < root.tracks.length - 1) {
+                    root.selected-index += 1;
+                }
+                return accept;
+            }
+            if (event.text == Key.Return) {
+                if (root.selected-index >= 0 && root.selected-index < root.tracks.length) {
+                    root.play-track(root.tracks[root.selected-index].path, 0.0);
+                }
+                return accept;
+            }
+            return reject;
+        }
+
+        HorizontalLayout {
         // Sidebar
         VerticalLayout {
             width: sidebar-width;
@@ -118,8 +153,10 @@ export component AppWindow inherits Window {
                             if !folder.has-children : Rectangle { width: 16px; }
 
                             TouchArea {
+                                horizontal-stretch: 1;
                                 clicked => { root.select-folder(folder.path); }
                                 Text {
+                                    width: 100%;
                                     text: folder.name;
                                     color: #ccc;
                                     vertical-alignment: center;
@@ -302,7 +339,8 @@ export component AppWindow inherits Window {
                         }
                         clicked => { 
                             selected-index = i;
-                            root.play-track(track.path); 
+                            main-focus.focus();
+                            root.play-track(track.path, 0.0); 
                         }
                     }
 
@@ -338,8 +376,13 @@ export component AppWindow inherits Window {
                             text: is-playing ? "Stop" : "Play";
                             width: 100px;
                             clicked => {
-                                if (is-playing) { root.stop-track(); }
-                                // Play logic is usually triggered by selecting a track in this version
+                                if (is-playing) { 
+                                    root.stop-track(); 
+                                } else {
+                                    if (root.selected-index >= 0) {
+                                        root.play-track(root.tracks[root.selected-index].path, 0.0);
+                                    }
+                                }
                             }
                         }
                         if root.selected-index >= 0 : Button {
@@ -389,7 +432,11 @@ export component AppWindow inherits Window {
                         }
                         TouchArea {
                             clicked => {
-                                root.seek-track(self.mouse-x / self.width);
+                                if (!is-playing && root.selected-index >= 0) {
+                                    root.play-track(root.tracks[root.selected-index].path, self.mouse-x / self.width);
+                                } else {
+                                    root.seek-track(self.mouse-x / self.width);
+                                }
                             }
                         }
                     }
@@ -404,6 +451,7 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
         }
     }
 }

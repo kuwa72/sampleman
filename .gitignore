@@ -27,6 +27,5 @@ src-tauri/bin
 # Workspace / AI Agents
 .agents/
 .gemini/
-check_output.txt
-
+check_output*.txt
 soundfont.sf2

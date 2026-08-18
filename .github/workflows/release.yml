@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: sampleman.exe
+            asset_type: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: sampleman
+            asset_type: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: sampleman
+            asset_type: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig1-dev
+
+      - name: Build Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Asset
+        shell: bash
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          if [ -z "$TAG_NAME" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ github.event.inputs.tag }}"
+          fi
+          ARCHIVE_NAME="sampleman-${TAG_NAME}-${{ matrix.target }}"
+          
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
+          [ -f README.md ] && cp README.md dist/
+          
+          cd dist
+          if [ "${{ matrix.asset_type }}" = "zip" ]; then
+            7z a "../${ARCHIVE_NAME}.zip" *
+          else
+            tar -czvf "../${ARCHIVE_NAME}.tar.gz" *
+          fi
+          cd ..
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampleman-${{ matrix.target }}
+          path: sampleman-*.*
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ github.ref_name != '' && github.ref_name || github.event.inputs.tag }}
+          files: sampleman-*.*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

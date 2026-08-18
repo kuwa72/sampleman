@@ -1,17 +1,18 @@
-mod database;
+pub mod database;
 mod scanner;
-mod audio;
+pub mod audio;
 
 use crate::database::{Database, Track};
 use crate::scanner::{Scanner, ScanProgress};
 use std::sync::{Arc, Mutex};
 use rodio::{OutputStream, Sink};
-use slint::{ComponentHandle, SharedString, VecModel, ModelRc, Image, SharedPixelBuffer, Rgba8Pixel};
+use slint::{ComponentHandle, SharedString, Image, SharedPixelBuffer, Rgba8Pixel};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use chrono::{TimeZone, Local};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use rayon::prelude::*;
 
 slint::include_modules!();
 
@@ -26,7 +27,7 @@ struct UiState {
     expanded_folders: HashSet<String>,
     search_query: String,
     selected_folder: String,
-    all_tracks: Vec<Track>, // Cached tracks in memory
+    all_tracks: Arc<Vec<Track>>, // Cached tracks in memory
     sort_column: String,
     sort_asc: bool,
     folder_search_query: String, // Added
@@ -69,7 +70,7 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
         }
     }
     
-    let matcher = SkimMatcherV2::default();
+    let matcher = SkimMatcherV2::default().ignore_case();
     let mut visible_paths = HashSet::new();
 
     if !folder_query.is_empty() {
@@ -137,40 +138,41 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
     items
 }
 
-fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<TrackData> {
-    let matcher = SkimMatcherV2::default();
-    
-    let mut filtered: Vec<(&Track, i64)> = tracks.iter()
-        .filter(|t| folder.is_empty() || t.path.starts_with(folder))
-        .filter_map(|t| {
+fn get_filtered_track_indices(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<usize> {
+    let mut filtered: Vec<(usize, i64)> = tracks.par_iter()
+        .enumerate()
+        .filter(|(_, t)| folder.is_empty() || t.path.starts_with(folder))
+        .filter_map(|(idx, t)| {
             if query.is_empty() {
-                return Some((t, 0));
+                return Some((idx, 0));
             }
             
+            let matcher = SkimMatcherV2::default().ignore_case();
             let filename = Path::new(&t.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let score_fn = matcher.fuzzy_match(&filename, query).unwrap_or(0);
             
-            let score_title = if let Some(ref title) = t.title {
-                matcher.fuzzy_match(title, query).unwrap_or(0)
-            } else { 0 };
+            let score_title = match t.title {
+                Some(ref title) => matcher.fuzzy_match(title, query).unwrap_or(0),
+                None => 0,
+            };
             
             let score_path = matcher.fuzzy_match(&t.path, query).unwrap_or(0);
             let max_score = score_fn.max(score_title).max(score_path);
             
             if max_score > 0 {
-                Some((t, max_score))
+                Some((idx, max_score))
             } else {
                 None
             }
         })
         .collect();
 
-    filtered.sort_by(|a, b| {
-        let (at, a_score) = a;
-        let (bt, b_score) = b;
+    filtered.sort_by(|&(a_idx, a_score), &(b_idx, b_score)| {
+        let at = &tracks[a_idx];
+        let bt = &tracks[b_idx];
         
         if !query.is_empty() && sort_column == "name" {
-            let s_cmp = b_score.cmp(a_score); // Score DESC
+            let s_cmp = b_score.cmp(&a_score); // Score DESC
             if s_cmp != std::cmp::Ordering::Equal {
                 return s_cmp;
             }
@@ -192,7 +194,7 @@ fn get_filtered_tracks(tracks: &[Track], folder: &str, query: &str, sort_column:
         if sort_asc { res } else { res.reverse() }
     });
 
-    filtered.into_iter().map(|(t, _)| map_track_to_slint(t)).collect()
+    filtered.into_iter().map(|(idx, _)| idx).collect()
 }
 
 fn create_waveform_pixels(waveform: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -233,6 +235,92 @@ fn create_waveform_pixels(waveform: &[u8]) -> (u32, u32, Vec<u8>) {
     (width, height, pixels)
 }
 
+struct TrackListModel {
+    tracks: Arc<Vec<Track>>,
+    indices: Vec<usize>,
+    notify: slint::ModelNotify,
+}
+
+impl slint::Model for TrackListModel {
+    type Data = TrackData;
+
+    fn row_count(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.indices.get(row).and_then(|&idx| self.tracks.get(idx).map(map_track_to_slint))
+    }
+
+    fn model_tracker(&self) -> &dyn slint::ModelTracker {
+        &self.notify
+    }
+}
+
+fn update_tracks_ui(
+    ui_weak: &slint::Weak<AppWindow>,
+    st: &UiState,
+    search_generation: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let folder = st.selected_folder.clone();
+    let query = st.search_query.clone();
+    let col = st.sort_column.clone();
+    let asc = st.sort_asc;
+    let all_tracks = st.all_tracks.clone();
+
+    let gen = search_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let s_gen = search_generation.clone();
+    let ui_handle = ui_weak.clone();
+
+    std::thread::spawn(move || {
+        let indices = get_filtered_track_indices(&all_tracks, &folder, &query, &col, asc);
+        
+        if s_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+            return;
+        }
+
+        slint::invoke_from_event_loop(move || {
+            let model = TrackListModel {
+                tracks: all_tracks,
+                indices,
+                notify: slint::ModelNotify::default(),
+            };
+            if let Some(ui) = ui_handle.upgrade() {
+                ui.set_tracks(slint::ModelRc::new(model));
+                ui.set_selected_index(-1);
+            }
+        }).ok();
+    });
+}
+
+fn update_folders_ui(
+    ui_weak: &slint::Weak<AppWindow>,
+    st: &UiState,
+    folder_search_generation: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let expanded = st.expanded_folders.clone();
+    let query = st.folder_search_query.clone();
+    let all_tracks = st.all_tracks.clone();
+
+    let gen = folder_search_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let f_gen = folder_search_generation.clone();
+    let ui_handle = ui_weak.clone();
+
+    std::thread::spawn(move || {
+        let folders = extract_folders_hierarchical(&all_tracks, &expanded, &query);
+        
+        if f_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+            return;
+        }
+
+        slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                ui.set_folders(slint::ModelRc::new(slint::VecModel::from(folders)));
+            }
+        }).ok();
+    });
+}
+
 pub fn run() -> anyhow::Result<()> {
     let db = Arc::new(Mutex::new(Database::new("library.db").expect("failed to open database")));
     
@@ -265,11 +353,14 @@ pub fn run() -> anyhow::Result<()> {
         expanded_folders: HashSet::new(),
         search_query: String::new(),
         selected_folder: saved_folder,
-        all_tracks: initial_tracks,
+        all_tracks: Arc::new(initial_tracks),
         sort_column: saved_col,
         sort_asc: saved_asc,
         folder_search_query: String::new(),
     }));
+
+    let search_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let folder_search_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let timer = slint::Timer::default();
     let ui_handle_timer = ui_weak.clone();
@@ -296,21 +387,21 @@ pub fn run() -> anyhow::Result<()> {
         ui.set_current_sort_column(SharedString::from(&ui_state_guard.sort_column));
         ui.set_current_sort_asc(ui_state_guard.sort_asc);
 
-        let folder_items = extract_folders_hierarchical(&ui_state_guard.all_tracks, &ui_state_guard.expanded_folders, &ui_state_guard.folder_search_query);
-        ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
-
-        let track_data = get_filtered_tracks(&ui_state_guard.all_tracks, &ui_state_guard.selected_folder, &ui_state_guard.search_query, &ui_state_guard.sort_column, ui_state_guard.sort_asc);
-        ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
-        ui.set_selected_index(-1);
+        update_folders_ui(&ui_weak, &ui_state_guard, &folder_search_generation);
+        update_tracks_ui(&ui_weak, &ui_state_guard, &search_generation);
     }
 
     let state_scan = state.clone();
     let ui_handle_scan = ui_weak.clone();
     let ui_state_scan = ui_state.clone();
+    let scan_search_gen = search_generation.clone();
+    let scan_folder_gen = folder_search_generation.clone();
     ui.on_scan_library(move |path_arg| {
         let state = state_scan.clone();
         let ui_weak = ui_handle_scan.clone();
         let ui_state = ui_state_scan.clone();
+        let s_gen = scan_search_gen.clone();
+        let f_gen = scan_folder_gen.clone();
         let path_str = path_arg.to_string();
 
         let path = if path_str.is_empty() {
@@ -356,17 +447,16 @@ pub fn run() -> anyhow::Result<()> {
                 println!("Tracks total after load: {}", tracks.len());
                 
                 let mut st = ui_state.lock().unwrap();
-                st.all_tracks = tracks.clone(); // Update cache!
-                let folder_items = extract_folders_hierarchical(&tracks, &st.expanded_folders, &st.folder_search_query);
-                let track_data = get_filtered_tracks(&tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
+                st.all_tracks = Arc::new(tracks); // Update cache!
                 
+                update_folders_ui(&ui_weak, &st, &f_gen);
+                update_tracks_ui(&ui_weak, &st, &s_gen);
+                
+                let ui_weak_complete = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
+                    if let Some(ui) = ui_weak_complete.upgrade() {
                         ui.set_is_scanning(false);
                         ui.set_status_text("Scan Complete".into());
-                        ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
-                        ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
-                        ui.set_selected_index(-1);
                     }
                 }).ok();
             });
@@ -375,11 +465,13 @@ pub fn run() -> anyhow::Result<()> {
     let state_filter = state.clone();
     let ui_handle_filter = ui_weak.clone();
     let ui_state_filter = ui_state.clone();
+    let select_folder_search_gen = search_generation.clone();
     ui.on_select_folder(move |path| {
         let path_str = path.to_string();
         {
             let mut st = ui_state_filter.lock().unwrap();
             st.selected_folder = path_str.clone();
+            update_tracks_ui(&ui_handle_filter, &st, &select_folder_search_gen);
         }
         if let Some(ui) = ui_handle_filter.upgrade() {
             ui.set_selected_folder(SharedString::from(&path_str));
@@ -391,27 +483,11 @@ pub fn run() -> anyhow::Result<()> {
             let db_lock = db.lock().unwrap();
             let _ = db_lock.set_setting("selected_folder", &path_for_db);
         });
-
-        let state = state_filter.clone();
-        let ui_weak = ui_handle_filter.clone();
-        let ui_state = ui_state_filter.clone();
-
-        std::thread::spawn(move || {
-            let st = ui_state.lock().unwrap();
-            let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
-            
-            slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
-                    ui.set_selected_index(-1);
-                }
-            }).ok();
-        });
     });
 
-    let state_toggle = state.clone();
     let ui_handle_toggle = ui_weak.clone();
     let ui_state_toggle = ui_state.clone();
+    let toggle_folder_gen = folder_search_generation.clone();
     ui.on_toggle_folder(move |path| {
         let path_str = path.to_string();
         let mut st = ui_state_toggle.lock().unwrap();
@@ -421,33 +497,28 @@ pub fn run() -> anyhow::Result<()> {
             st.expanded_folders.insert(path_str);
         }
 
-        let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
-        if let Some(ui) = ui_handle_toggle.upgrade() {
-            ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
-        }
+        update_folders_ui(&ui_handle_toggle, &st, &toggle_folder_gen);
     });
 
-    let state_search = state.clone();
     let ui_handle_search = ui_weak.clone();
     let ui_state_search = ui_state.clone();
+    let search_track_gen = search_generation.clone();
     ui.on_search_tracks(move |query| {
         let mut st = ui_state_search.lock().unwrap();
         st.search_query = query.to_string();
 
-        let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
-        if let Some(ui) = ui_handle_search.upgrade() {
-            ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
-            ui.set_selected_index(-1);
-        }
+        update_tracks_ui(&ui_handle_search, &st, &search_track_gen);
     });
 
     let state_play = state.clone();
     let ui_handle_play = ui_weak.clone();
     let ui_state_play = ui_state.clone();
-    ui.on_play_track(move |path| {
+    let play_folder_gen = folder_search_generation.clone();
+    ui.on_play_track(move |path, initial_progress| {
         let state = state_play.clone();
         let ui_handle = ui_handle_play.clone();
         let path_str = path.to_string();
+        let initial_progress = initial_progress as f64;
 
         {
             let mut st = ui_state_play.lock().unwrap();
@@ -467,14 +538,13 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     st.expanded_folders.insert(parent_str.clone());
                     
-                    let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
-                    let sel_f = st.selected_folder.clone();
+                    let cur_folder = st.selected_folder.clone();
+                    update_folders_ui(&ui_handle, &st, &play_folder_gen);
                     
                     let ui_weak = ui_handle.clone();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
-                            ui.set_selected_folder(SharedString::from(sel_f));
+                            ui.set_selected_folder(SharedString::from(cur_folder));
                         }
                     }).ok();
                 }
@@ -508,13 +578,14 @@ pub fn run() -> anyhow::Result<()> {
                         ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
                         
                         ui.set_is_playing(true);
-                        ui.set_play_progress(0.0);
+                        ui.set_play_progress(initial_progress as f32);
                     }
                 }).ok();
 
                 {
                     let mut cp = state.current_playback.lock().unwrap();
-                    *cp = Some((duration, std::time::Instant::now()));
+                    let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(duration * initial_progress);
+                    *cp = Some((duration, start_time));
                 }
 
                 let (seek_tx, seek_rx) = crossbeam_channel::unbounded::<f64>();
@@ -537,6 +608,11 @@ pub fn run() -> anyhow::Result<()> {
                         }
                     }
                 };
+
+                if initial_progress > 0.0 {
+                    let secs = duration * initial_progress;
+                    let _ = seek_tx.send(secs);
+                }
 
                 state.sink.stop();
                 state.sink.append(source);
@@ -620,6 +696,7 @@ pub fn run() -> anyhow::Result<()> {
     let state_sort = state.clone();
     let ui_handle_sort = ui_weak.clone();
     let ui_state_sort = ui_state.clone();
+    let sort_track_gen = search_generation.clone();
     ui.on_sort_tracks(move |column| {
         let mut st = ui_state_sort.lock().unwrap();
         let col_str = column.to_string();
@@ -646,23 +723,17 @@ pub fn run() -> anyhow::Result<()> {
             ui.set_current_sort_asc(asc);
         }
 
-        let track_data = get_filtered_tracks(&st.all_tracks, &st.selected_folder, &st.search_query, &st.sort_column, st.sort_asc);
-        if let Some(ui) = ui_handle_sort.upgrade() {
-            ui.set_tracks(ModelRc::new(VecModel::from(track_data)));
-            ui.set_selected_index(-1);
-        }
+        update_tracks_ui(&ui_handle_sort, &st, &sort_track_gen);
     });
 
     let ui_state_folder_search = ui_state.clone();
     let ui_handle_folder_search = ui_weak.clone();
+    let folder_search_gen = folder_search_generation.clone();
     ui.on_search_folders(move |query| {
         let mut st = ui_state_folder_search.lock().unwrap();
         st.folder_search_query = query.to_string();
 
-        let folder_items = extract_folders_hierarchical(&st.all_tracks, &st.expanded_folders, &st.folder_search_query);
-        if let Some(ui) = ui_handle_folder_search.upgrade() {
-            ui.set_folders(ModelRc::new(VecModel::from(folder_items)));
-        }
+        update_folders_ui(&ui_handle_folder_search, &st, &folder_search_gen);
     });
 
     ui.run()?;
