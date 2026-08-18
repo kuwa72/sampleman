@@ -637,18 +637,21 @@ pub fn run() -> anyhow::Result<()> {
     ui.on_start_drag(move |path| {
         if let Some(ui) = ui_handle_drag.upgrade() {
             let path_str = path.to_string();
-            let item = drag::DragItem::Files(vec![PathBuf::from(path_str)]);
+            let _item = drag::DragItem::Files(vec![PathBuf::from(path_str)]);
             
-            use i_slint_backend_winit::WinitWindowAccessor;
-            ui.window().with_winit_window(|winit_window| {
-                let _ = drag::start_drag(
-                    winit_window,
-                    item,
-                    drag::Image::Raw(vec![0; 4]),
-                    |_, _| {},
-                    drag::Options::default(),
-                );
-            });
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                use i_slint_backend_winit::WinitWindowAccessor;
+                ui.window().with_winit_window(|winit_window| {
+                    let _ = drag::start_drag(
+                        winit_window,
+                        _item,
+                        drag::Image::Raw(vec![0; 4]),
+                        |_, _| {},
+                        drag::Options::default(),
+                    );
+                });
+            }
         }
     });
 
