@@ -77,6 +77,12 @@ impl<'a> Scanner<'a> {
         let total = entries.len();
         println!("Found {} potential audio files to analyze.", total);
         if total == 0 {
+            progress_tx.send(ScanProgress {
+                total: 0,
+                current: 0,
+                path: "All files up to date".into(),
+                stage: "Done".into(),
+            }).ok();
             return Ok(());
         }
 
@@ -169,7 +175,7 @@ impl<'a> Scanner<'a> {
         }
 
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        matches!(ext.as_str(), "wav" | "mp3" | "aif" | "aiff" | "m4a" | "ogg" | "wma" | "mid" | "midi")
+        matches!(ext.as_str(), "wav" | "mp3" | "flac" | "aif" | "aiff" | "m4a" | "ogg" | "wma" | "mid" | "midi" | "aac")
     }
 
 
