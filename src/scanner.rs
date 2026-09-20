@@ -213,10 +213,22 @@ impl<'a> Scanner<'a> {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
         
         if ext == "mid" || ext == "midi" {
-            let mut file = fs::File::open(path)?;
-            let midi = rustysynth::MidiFile::new(&mut file).map_err(|e| anyhow::anyhow!("MIDI parse error: {:?}", e))?;
+            let bytes = fs::read(path)?;
+            // Scan-time MIDI summary (midly, no synth needed). Tolerated:
+            // a file rustysynth can play but midly chokes on still scans
+            // with NULL MIDI columns.
+            let summary = crate::midi_util::parse_summary(&bytes).ok();
+            let midi = rustysynth::MidiFile::new(&mut &bytes[..]).map_err(|e| anyhow::anyhow!("MIDI parse error: {:?}", e))?;
             let duration = midi.get_length();
-            
+            let (midi_channels, midi_programs, has_drums) = match summary {
+                Some(s) => (
+                    Some(s.channels.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")),
+                    Some(s.programs.iter().map(|(c, p)| format!("{c}:{p}")).collect::<Vec<_>>().join(",")),
+                    Some(if s.has_drums { 1i64 } else { 0i64 }),
+                ),
+                None => (None, None, None),
+            };
+
             return Ok(TrackData {
                 path: path_str.to_string(),
                 mtime,
@@ -231,6 +243,9 @@ impl<'a> Scanner<'a> {
                 channels: Some(2),
                 comment: None,
                 waveform: Some(Vec::new()), // Empty waveform
+                midi_channels,
+                midi_programs,
+                has_drums,
             });
         }
 
@@ -305,6 +320,9 @@ impl<'a> Scanner<'a> {
             channels,
             comment,
             waveform: Some(waveform),
+            midi_channels: None,
+            midi_programs: None,
+            has_drums: None,
         })
     }
 

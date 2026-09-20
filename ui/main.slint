@@ -1,4 +1,4 @@
-import { StandardListView, VerticalBox, HorizontalBox, Button, ProgressIndicator, ScrollView, ListView, LineEdit } from "std-widgets.slint";
+import { StandardListView, VerticalBox, HorizontalBox, Button, ProgressIndicator, ScrollView, ListView, LineEdit, ComboBox } from "std-widgets.slint";
 
 export struct TrackData {
     id: int,
@@ -41,6 +41,8 @@ export component AppWindow inherits Window {
     callback open-in-file-manager(string);
     callback sort-tracks(string);
     callback search-folders(string);
+    callback midi-mode-changed(string);
+    callback midi-program-changed(string);
 
 
     in-out property <[TrackData]> tracks: [];
@@ -59,6 +61,10 @@ export component AppWindow inherits Window {
     in-out property <string> selected-folder: "";
     in-out property <string> current-sort-column: "name";
     in-out property <bool> current-sort-asc: true;
+    in-out property <[string]> midi-mode-model: ["Auto", "Synth", "Drums"];
+    in-out property <int> midi-mode-index: 0;
+    in-out property <[string]> midi-program-model: ["Auto"];
+    in-out property <int> midi-program-index: 0;
 
     forward-focus: main-focus;
 
@@ -361,7 +367,7 @@ export component AppWindow inherits Window {
 
             // Bottom Player Area
             Rectangle {
-                height: 160px;
+                height: 195px;
                 background: #111;
                 border-radius: 8px;
                 
@@ -406,6 +412,35 @@ export component AppWindow inherits Window {
                                 font-size: 11px;
                                 overflow: elide;
                             }
+                        }
+                    }
+
+                    // MIDI channel mode + program (inert for audio files)
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Ch:";
+                            color: #888;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            model: root.midi-mode-model;
+                            current-index <=> root.midi-mode-index;
+                            width: 90px;
+                            selected(v) => { root.midi-mode-changed(v); }
+                        }
+                        Text {
+                            text: "Sound:";
+                            color: #888;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            model: root.midi-program-model;
+                            current-index <=> root.midi-program-index;
+                            horizontal-stretch: 1;
+                            selected(v) => { root.midi-program-changed(v); }
                         }
                     }
 

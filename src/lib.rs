@@ -1,6 +1,7 @@
 pub mod database;
 mod scanner;
 pub mod audio;
+mod midi_util;
 
 use crate::database::{Database, Track};
 use crate::scanner::{Scanner, ScanProgress};
@@ -33,6 +34,8 @@ struct UiState {
     sort_column: String,
     sort_asc: bool,
     folder_search_query: String, // Added
+    midi_mode: i32,    // ChannelMode ComboBox index: 0=Auto, 1=Synth, 2=Drums
+    midi_program: i32, // Program ComboBox index: 0=Auto, 1..=128=GM program+1
 }
 
 /// Lock a mutex, recovering from poisoning instead of panicking.
@@ -251,6 +254,55 @@ fn create_waveform_pixels(waveform: &[u8]) -> (u32, u32, Vec<u8>) {
     (width, height, pixels)
 }
 
+fn create_piano_roll_pixels(notes: &[midi_util::NoteEv]) -> (u32, u32, Vec<u8>) {
+    let width = 800;
+    let height = 100;
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+    for i in 0..pixels.len() / 4 {
+        pixels[i * 4] = 0;
+        pixels[i * 4 + 1] = 0;
+        pixels[i * 4 + 2] = 0;
+        pixels[i * 4 + 3] = 255;
+    }
+
+    let max_end = notes.iter().map(|n| n.end_sec).fold(0.0f64, f64::max);
+    if !(max_end > 0.0) {
+        return (width, height, pixels);
+    }
+
+    for n in notes {
+        let x0 = (n.start_sec / max_end * width as f64).clamp(0.0, width as f64 - 1.0) as u32;
+        let x1 = ((n.end_sec / max_end * width as f64).ceil() as u32).max(x0 + 1).min(width);
+        // Pitch 0-127 maps bottom-to-top; channel 9 (drums) in red/orange.
+        let y_top = (height - 1).saturating_sub((n.pitch as u32 * height) / 128);
+        let (r, g, b) = if n.channel == 9 {
+            (255, 110, 30)
+        } else {
+            match n.channel % 4 {
+                0 => (0, 180, 255),
+                1 => (0, 255, 170),
+                2 => (150, 255, 80),
+                _ => (190, 130, 255),
+            }
+        };
+        for x in x0..x1 {
+            for dy in 0..2 {
+                let y = (y_top + dy).min(height - 1);
+                let p_idx = (y * width + x) as usize * 4;
+                if p_idx + 3 < pixels.len() {
+                    pixels[p_idx] = r;
+                    pixels[p_idx + 1] = g;
+                    pixels[p_idx + 2] = b;
+                    pixels[p_idx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    (width, height, pixels)
+}
+
 struct TrackListModel {
     tracks: Arc<Vec<Track>>,
     indices: Vec<usize>,
@@ -363,14 +415,18 @@ pub fn run() -> anyhow::Result<()> {
         is_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
-    let (initial_tracks, saved_folder, saved_col, saved_asc) = {
+    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog) = {
         let db_lock = lock_mutex(&db);
         let tracks = db_lock.get_all_tracks().unwrap_or_default();
         let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
         let col = db_lock.get_setting("sort_column").unwrap_or_default().unwrap_or_else(|| String::from("name"));
         let asc_str = db_lock.get_setting("sort_asc").unwrap_or_default().unwrap_or_else(|| String::from("true"));
         let asc = asc_str == "true";
-        (tracks, folder, col, asc)
+        let mode = db_lock.get_setting("midi_mode").unwrap_or_default()
+            .and_then(|s| s.parse::<i32>().ok()).filter(|i| (0..=2).contains(i)).unwrap_or(0);
+        let prog = db_lock.get_setting("midi_program").unwrap_or_default()
+            .and_then(|s| s.parse::<i32>().ok()).filter(|i| (0..=128).contains(i)).unwrap_or(0);
+        (tracks, folder, col, asc, mode, prog)
     };
 
     let ui_state = Arc::new(Mutex::new(UiState {
@@ -381,6 +437,8 @@ pub fn run() -> anyhow::Result<()> {
         sort_column: saved_col,
         sort_asc: saved_asc,
         folder_search_query: String::new(),
+        midi_mode: saved_mode,
+        midi_program: saved_prog,
     }));
 
     let search_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -416,6 +474,13 @@ pub fn run() -> anyhow::Result<()> {
         ui.set_selected_folder(SharedString::from(&ui_state_guard.selected_folder));
         ui.set_current_sort_column(SharedString::from(&ui_state_guard.sort_column));
         ui.set_current_sort_asc(ui_state_guard.sort_asc);
+        ui.set_midi_mode_index(ui_state_guard.midi_mode);
+        ui.set_midi_program_index(ui_state_guard.midi_program);
+        let prog_model: Vec<SharedString> = midi_util::program_model_entries()
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        ui.set_midi_program_model(slint::ModelRc::new(slint::VecModel::from(prog_model)));
 
         update_folders_ui(&ui_weak, &ui_state_guard, &folder_search_generation);
         update_tracks_ui(&ui_weak, &ui_state_guard, &search_generation);
@@ -675,6 +740,15 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
 
+        // Snapshot the MIDI channel/program selections on the UI thread.
+        let midi_options = {
+            let st = lock_mutex(&ui_state_play);
+            crate::audio::MidiPlayOptions {
+                mode: midi_util::ChannelMode::from_index(st.midi_mode),
+                program: midi_util::program_from_index(st.midi_program),
+            }
+        };
+
         std::thread::spawn(move || {
             let my_gen = state.playback_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let is_latest = || state.playback_generation.load(std::sync::atomic::Ordering::SeqCst) == my_gen;
@@ -716,7 +790,7 @@ pub fn run() -> anyhow::Result<()> {
             let ext = Path::new(&path_str).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
 
             let source = if ext == "mid" || ext == "midi" {
-                match crate::audio::MidiSource::new(&path_str, seek_rx) {
+                match crate::audio::MidiSource::new(&path_str, seek_rx, midi_options) {
                     Ok(s) => crate::audio::DynamicSource::Midi(s),
                     Err(e) => {
                         eprintln!("Failed to create MidiSource: {}", e);
@@ -792,7 +866,38 @@ pub fn run() -> anyhow::Result<()> {
             }
 
             let path_for_ui = path_str.clone();
-            let (width, height, pixels) = create_waveform_pixels(&waveform_data.unwrap_or_default());
+            // MIDI tracks render a piano roll into the waveform slot (files
+            // are small, so parse on demand); audio keeps the DB waveform.
+            // Empty/parse-failure falls back to blank + a status-text note.
+            let (width, height, pixels, roll_note): (u32, u32, Vec<u8>, Option<String>) =
+                if ext == "mid" || ext == "midi" {
+                    match std::fs::read(&path_str) {
+                        Ok(bytes) => match midi_util::notes_for_roll(&bytes) {
+                            Ok(notes) if !notes.is_empty() => {
+                                let (w, h, px) = create_piano_roll_pixels(&notes);
+                                (w, h, px, None)
+                            }
+                            Ok(_) => {
+                                eprintln!("MIDI piano roll: no notes in {}", path_str);
+                                let (w, h, px) = create_piano_roll_pixels(&[]);
+                                (w, h, px, Some(format!("MIDI: no notes found in {}", filename)))
+                            }
+                            Err(e) => {
+                                eprintln!("MIDI piano roll parse failed for {}: {}", path_str, e);
+                                let (w, h, px) = create_piano_roll_pixels(&[]);
+                                (w, h, px, Some(format!("MIDI piano roll unavailable: {}", e)))
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("MIDI piano roll read failed for {}: {}", path_str, e);
+                            let (w, h, px) = create_piano_roll_pixels(&[]);
+                            (w, h, px, Some(format!("MIDI piano roll unavailable: {}", e)))
+                        }
+                    }
+                } else {
+                    let (w, h, px) = create_waveform_pixels(&waveform_data.unwrap_or_default());
+                    (w, h, px, None)
+                };
             let gen_for_ui = state.playback_generation.clone();
 
             slint::invoke_from_event_loop(move || {
@@ -809,6 +914,10 @@ pub fn run() -> anyhow::Result<()> {
                         dest.copy_from_slice(&pixels);
                     }
                     ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
+
+                    if let Some(note) = roll_note {
+                        ui.set_status_text(SharedString::from(note));
+                    }
 
                     ui.set_is_playing(true);
                     ui.set_play_progress(initial_progress as f32);
@@ -939,6 +1048,52 @@ pub fn run() -> anyhow::Result<()> {
         st.folder_search_query = query.to_string();
 
         update_folders_ui(&ui_handle_folder_search, &st, &folder_search_gen);
+    });
+
+    // MIDI channel-mode / program selections: live in UiState (read at play
+    // time) and persist in settings like sort_column. ComboBox `selected`
+    // carries the value string; resolve back to the model index here.
+    let state_midi_mode = state.clone();
+    let ui_state_midi_mode = ui_state.clone();
+    ui.on_midi_mode_changed(move |value| {
+        let idx = match value.as_str() {
+            "Synth" => 1,
+            "Drums" => 2,
+            _ => 0,
+        };
+        {
+            let mut st = lock_mutex(&ui_state_midi_mode);
+            st.midi_mode = idx;
+        }
+        let db = state_midi_mode.db.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("midi_mode", &idx.to_string());
+        });
+    });
+
+    let state_midi_prog = state.clone();
+    let ui_state_midi_prog = ui_state.clone();
+    ui.on_midi_program_changed(move |value| {
+        // Model entries are "Auto" or "N: name" with N = GM program.
+        let idx = if value.as_str() == "Auto" {
+            0
+        } else {
+            value.as_str().split(':').next()
+                .and_then(|n| n.trim().parse::<i32>().ok())
+                .map(|p| p + 1)
+                .filter(|i| (1..=128).contains(i))
+                .unwrap_or(0)
+        };
+        {
+            let mut st = lock_mutex(&ui_state_midi_prog);
+            st.midi_program = idx;
+        }
+        let db = state_midi_prog.db.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("midi_program", &idx.to_string());
+        });
     });
 
     ui.run()?;
