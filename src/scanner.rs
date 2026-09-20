@@ -19,6 +19,15 @@ pub struct ScanProgress {
     pub stage: String, // "Scanning" | "Analyzing" | "Saving"
 }
 
+/// Stored waveform format version. Bump to force a one-time full rescan
+/// that regenerates waveforms saved in an older format.
+const WAVEFORM_VERSION: &str = "2";
+/// Fixed number of peaks stored per track: whole-file coverage resampled
+/// by max-pooling (stereo/mono unified, DB size bounded).
+const WAVEFORM_PEAKS: usize = 1200;
+/// Fine-grained frames aggregated into one peak before resampling.
+const FRAMES_PER_PEAK: usize = 200;
+
 pub struct Scanner<'a> {
     db: &'a Mutex<Database>,
 }
@@ -46,6 +55,15 @@ impl<'a> Scanner<'a> {
             db.get_all_metadata()?
         };
 
+        // Old-format (truncated/variable-length) waveforms are regenerated
+        // once: a version mismatch disables the up-to-date early-out below,
+        // forcing a full rescan. The version is persisted at the end of the
+        // scan, after which normal incremental behavior resumes.
+        let waveform_stale: bool = {
+            let db = self.db.lock().map_err(|_| anyhow::anyhow!("failed to lock database"))?;
+            db.get_setting("waveform_version")?.as_deref() != Some(WAVEFORM_VERSION)
+        };
+
         let entries: Vec<_> = WalkDir::new(dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -63,7 +81,7 @@ impl<'a> Scanner<'a> {
                     
                     if let Some(mtime) = mtime {
                         if let Some(&(db_mtime, db_size)) = existing_meta.get(&path_str) {
-                            if db_mtime == mtime && db_size == size {
+                            if !waveform_stale && db_mtime == mtime && db_size == size {
                                 return None;
                             }
                         }
@@ -83,6 +101,11 @@ impl<'a> Scanner<'a> {
                 path: "All files up to date".into(),
                 stage: "Done".into(),
             }).ok();
+            if let Ok(db) = self.db.lock() {
+                if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
+                    eprintln!("Failed to persist waveform_version: {}", e);
+                }
+            }
             return Ok(());
         }
 
@@ -164,6 +187,13 @@ impl<'a> Scanner<'a> {
                 println!("Final batch saved.");
             }
         });
+
+        // Waveforms are now current; the next scan resumes incremental behavior.
+        if let Ok(db) = self.db.lock() {
+            if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
+                eprintln!("Failed to persist waveform_version: {}", e);
+            }
+        }
 
         Ok(())
     }
@@ -247,18 +277,19 @@ impl<'a> Scanner<'a> {
         let track_id = track.id;
         let codec_params = &track.codec_params;
             
-        let duration = if let Some(n_frames) = codec_params.n_frames {
+        let header_duration = codec_params.n_frames.map(|n_frames| {
             n_frames as f64 / codec_params.sample_rate.unwrap_or(44100) as f64
-        } else {
-            0.0
-        };
+        });
 
         let sample_rate = codec_params.sample_rate;
         let bit_depth = codec_params.bits_per_sample;
         let channels = codec_params.channels.map(|c| c.count() as u16);
 
-        // Simplified Waveform
-        let waveform = self.extract_waveform(&mut format, track_id)?;
+        // Whole-file waveform plus measured duration (fallback when the
+        // header has no frame count, e.g. mp3). The header value wins when
+        // available.
+        let (waveform, measured_duration) = self.extract_waveform(&mut format, track_id)?;
+        let duration = header_duration.unwrap_or(measured_duration);
 
         Ok(TrackData {
             path: path_str.to_string(),
@@ -277,7 +308,15 @@ impl<'a> Scanner<'a> {
         })
     }
 
-    fn extract_waveform(&self, format: &mut Box<dyn symphonia::core::formats::FormatReader>, track_id: u32) -> anyhow::Result<Vec<u8>> {
+    /// Decodes the whole track, collecting peaks in FRAMES (interleaved
+    /// samples divided by the per-buffer channel count, so stereo/mono map
+    /// identically) plus the total decoded frame count.
+    ///
+    /// Returns `(peaks, duration_secs)` where peaks are resampled to exactly
+    /// [`WAVEFORM_PEAKS`] entries covering the full duration (empty when
+    /// nothing could be decoded) and `duration_secs` is
+    /// `total_frames / sample_rate` measured from the decoded stream.
+    fn extract_waveform(&self, format: &mut Box<dyn symphonia::core::formats::FormatReader>, track_id: u32) -> anyhow::Result<(Vec<u8>, f64)> {
         let mut decoder = {
             let track = format
                 .tracks()
@@ -287,10 +326,11 @@ impl<'a> Scanner<'a> {
             symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?
         };
 
-        let mut waveform = Vec::new();
-        let mut sample_count = 0;
+        let mut fine: Vec<u8> = Vec::new();
+        let mut total_frames: u64 = 0;
+        let mut sample_rate: u32 = 0;
+        let mut frames_in_peak = 0;
         let mut current_max: f32 = 0.0;
-        let samples_per_pixel = 200; // Much higher resolution
 
         while let Ok(packet) = format.next_packet() {
             if packet.track_id() != track_id {
@@ -299,31 +339,71 @@ impl<'a> Scanner<'a> {
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
+                    // Channel count may differ per packet; read it per buffer
+                    // and guard against zero to avoid division by zero.
+                    let channels = decoded.spec().channels.count().max(1);
+                    sample_rate = decoded.spec().rate;
                     let spec = *decoded.spec();
                     let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
                     buffer.copy_interleaved_ref(decoded);
 
-                    for &sample in buffer.samples() {
-                        current_max = current_max.max(sample.abs());
-                        sample_count += 1;
+                    let samples = buffer.samples();
+                    let n_frames = samples.len() / channels;
+                    for f in 0..n_frames {
+                        let mut frame_peak: f32 = 0.0;
+                        for c in 0..channels {
+                            frame_peak = frame_peak.max(samples[f * channels + c].abs());
+                        }
+                        current_max = current_max.max(frame_peak);
+                        frames_in_peak += 1;
 
-                        if sample_count >= samples_per_pixel {
-                            waveform.push((current_max * 255.0) as u8);
+                        if frames_in_peak >= FRAMES_PER_PEAK {
+                            fine.push((current_max * 255.0) as u8);
                             current_max = 0.0;
-                            sample_count = 0;
+                            frames_in_peak = 0;
                         }
                     }
+                    total_frames += n_frames as u64;
                 }
                 Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
                 Err(e) => return Err(e.into()),
             }
-            
-            // Limit waveform size for performance but higher than before
-            if waveform.len() >= 4000 {
-                break;
-            }
         }
 
-        Ok(waveform)
+        // Keep the trailing partial window so the file tail is covered.
+        if frames_in_peak > 0 {
+            fine.push((current_max * 255.0) as u8);
+        }
+
+        let measured_duration = if sample_rate > 0 {
+            total_frames as f64 / sample_rate as f64
+        } else {
+            0.0
+        };
+
+        Ok((resample_peaks(&fine, WAVEFORM_PEAKS), measured_duration))
     }
+}
+
+/// Resamples fine peaks to exactly `target` entries covering the same
+/// duration: max-pooling when downsampling, nearest-neighbor stretch when
+/// upsampling. Either way the linear time mapping used by the display is
+/// preserved. An empty input stays empty (nothing decodable).
+fn resample_peaks(fine: &[u8], target: usize) -> Vec<u8> {
+    if fine.is_empty() || fine.len() == target {
+        return fine.to_vec();
+    }
+    let mut out = Vec::with_capacity(target);
+    if fine.len() > target {
+        for i in 0..target {
+            let start = i * fine.len() / target;
+            let end = ((i + 1) * fine.len() / target).max(start + 1);
+            out.push(fine[start..end].iter().copied().max().unwrap_or(0));
+        }
+    } else {
+        for i in 0..target {
+            out.push(fine[i * fine.len() / target]);
+        }
+    }
+    out
 }
