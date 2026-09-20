@@ -33,14 +33,27 @@ struct UiState {
     folder_search_query: String, // Added
 }
 
+/// Lock a mutex, recovering from poisoning instead of panicking.
+///
+/// If another thread panicked while holding the lock, the mutex becomes
+/// poisoned. Rather than chaining a second panic (fatal with
+/// `panic = "abort"` in the release profile), take the inner value and
+/// keep running.
+fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn map_track_to_slint(t: &Track) -> TrackData {
     let filename = Path::new(&t.path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| t.path.clone());
 
-    let datetime = Local.timestamp_opt(t.mtime, 0).unwrap();
-    let mtime_str = datetime.format("%Y-%m-%d %H:%M").to_string();
+    let mtime_str = Local
+        .timestamp_opt(t.mtime, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     TrackData {
         id: t.id as i32,
@@ -80,7 +93,8 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
                 let mut curr = p.clone();
                 while !curr.as_os_str().is_empty() && curr.parent().is_some() {
                     visible_paths.insert(curr.clone());
-                    curr = curr.parent().unwrap().to_path_buf();
+                    let Some(parent) = curr.parent() else { break };
+                    curr = parent.to_path_buf();
                 }
             }
         }
@@ -322,10 +336,16 @@ fn update_folders_ui(
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let db = Arc::new(Mutex::new(Database::new("library.db").expect("failed to open database")));
-    
-    let (_stream, stream_handle) = OutputStream::try_default().expect("failed to open audio output");
-    let sink = Arc::new(Sink::try_new(&stream_handle).expect("failed to create audio sink"));
+    let db = Arc::new(Mutex::new(
+        Database::new("library.db").map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?,
+    ));
+
+    let (_stream, stream_handle) = OutputStream::try_default()
+        .map_err(|e| anyhow::anyhow!("failed to open audio output: {e}"))?;
+    let sink = Arc::new(
+        Sink::try_new(&stream_handle)
+            .map_err(|e| anyhow::anyhow!("failed to create audio sink: {e}"))?,
+    );
     
     Box::leak(Box::new(_stream));
 
@@ -340,7 +360,7 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     let (initial_tracks, saved_folder, saved_col, saved_asc) = {
-        let db_lock = db.lock().unwrap();
+        let db_lock = lock_mutex(&db);
         let tracks = db_lock.get_all_tracks().unwrap_or_default();
         let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
         let col = db_lock.get_setting("sort_column").unwrap_or_default().unwrap_or_else(|| String::from("name"));
@@ -368,7 +388,7 @@ pub fn run() -> anyhow::Result<()> {
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(100), move || {
         if let Some(ui) = ui_handle_timer.upgrade() {
             if ui.get_is_playing() {
-                let playback = state_timer.current_playback.lock().unwrap();
+                let playback = lock_mutex(&state_timer.current_playback);
                 if let Some((duration, start_time)) = *playback {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let progress = (elapsed / duration).min(1.0) as f32;
@@ -382,7 +402,7 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     {
-        let ui_state_guard = ui_state.lock().unwrap();
+        let ui_state_guard = lock_mutex(&ui_state);
         ui.set_selected_folder(SharedString::from(&ui_state_guard.selected_folder));
         ui.set_current_sort_column(SharedString::from(&ui_state_guard.sort_column));
         ui.set_current_sort_asc(ui_state_guard.sort_asc);
@@ -427,7 +447,7 @@ pub fn run() -> anyhow::Result<()> {
             let path_for_db = path.clone();
             let db = state.db.clone();
             {
-                let mut st = ui_state.lock().unwrap();
+                let mut st = lock_mutex(&ui_state);
                 st.selected_folder = path.clone();
                 st.expanded_folders.insert(path.clone());
             }
@@ -435,7 +455,7 @@ pub fn run() -> anyhow::Result<()> {
                 ui.set_selected_folder(SharedString::from(&path));
             }
             std::thread::spawn(move || {
-                let db_lock = db.lock().unwrap();
+                let db_lock = lock_mutex(&db);
                 let _ = db_lock.set_setting("selected_folder", &path_for_db);
             });
         }
@@ -470,12 +490,12 @@ pub fn run() -> anyhow::Result<()> {
             }
             println!("scan_directory finished. Querying matching tracks for sub-renders...");
             let tracks = {
-                let db = state.db.lock().unwrap();
+                let db = lock_mutex(&state.db);
                 db.get_all_tracks().unwrap_or_default()
             };
             println!("Tracks total after load: {}", tracks.len());
             
-            let mut st = ui_state.lock().unwrap();
+            let mut st = lock_mutex(&ui_state);
             st.all_tracks = Arc::new(tracks); // Update cache!
             
             update_folders_ui(&ui_weak, &st, &f_gen);
@@ -498,7 +518,7 @@ pub fn run() -> anyhow::Result<()> {
     ui.on_select_folder(move |path| {
         let path_str = path.to_string();
         {
-            let mut st = ui_state_filter.lock().unwrap();
+            let mut st = lock_mutex(&ui_state_filter);
             st.selected_folder = path_str.clone();
             update_tracks_ui(&ui_handle_filter, &st, &select_folder_search_gen);
         }
@@ -509,7 +529,7 @@ pub fn run() -> anyhow::Result<()> {
         let db = state_filter.db.clone();
         let path_for_db = path_str.clone();
         std::thread::spawn(move || {
-            let db_lock = db.lock().unwrap();
+            let db_lock = lock_mutex(&db);
             let _ = db_lock.set_setting("selected_folder", &path_for_db);
         });
     });
@@ -519,7 +539,7 @@ pub fn run() -> anyhow::Result<()> {
     let toggle_folder_gen = folder_search_generation.clone();
     ui.on_toggle_folder(move |path| {
         let path_str = path.to_string();
-        let mut st = ui_state_toggle.lock().unwrap();
+        let mut st = lock_mutex(&ui_state_toggle);
         if st.expanded_folders.contains(&path_str) {
             st.expanded_folders.remove(&path_str);
         } else {
@@ -533,7 +553,7 @@ pub fn run() -> anyhow::Result<()> {
     let ui_state_search = ui_state.clone();
     let search_track_gen = search_generation.clone();
     ui.on_search_tracks(move |query| {
-        let mut st = ui_state_search.lock().unwrap();
+        let mut st = lock_mutex(&ui_state_search);
         st.search_query = query.to_string();
 
         update_tracks_ui(&ui_handle_search, &st, &search_track_gen);
@@ -550,7 +570,7 @@ pub fn run() -> anyhow::Result<()> {
         let initial_progress = initial_progress as f64;
 
         {
-            let mut st = ui_state_play.lock().unwrap();
+            let mut st = lock_mutex(&ui_state_play);
             let p = PathBuf::from(&path_str);
             if let Some(parent) = p.parent() {
                 let parent_str = parent.to_string_lossy().to_string();
@@ -582,7 +602,7 @@ pub fn run() -> anyhow::Result<()> {
 
         std::thread::spawn(move || {
             let track = {
-                let db = state.db.lock().unwrap();
+                let db = lock_mutex(&state.db);
                 db.get_track_by_path(&path_str).ok().flatten()
             };
 
@@ -603,7 +623,10 @@ pub fn run() -> anyhow::Result<()> {
                         ui.set_current_track_info(SharedString::from(path_for_ui));
                         
                         let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-                        pixel_buffer.make_mut_bytes().copy_from_slice(&pixels);
+                        let dest = pixel_buffer.make_mut_bytes();
+                        if dest.len() == pixels.len() {
+                            dest.copy_from_slice(&pixels);
+                        }
                         ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
                         
                         ui.set_is_playing(true);
@@ -612,7 +635,7 @@ pub fn run() -> anyhow::Result<()> {
                 }).ok();
 
                 {
-                    let mut cp = state.current_playback.lock().unwrap();
+                    let mut cp = lock_mutex(&state.current_playback);
                     let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(duration * initial_progress);
                     *cp = Some((duration, start_time));
                 }
@@ -647,7 +670,7 @@ pub fn run() -> anyhow::Result<()> {
                 state.sink.append(source);
                 state.sink.play();
 
-                let mut tx_guard = state.seek_tx.lock().unwrap();
+                let mut tx_guard = lock_mutex(&state.seek_tx);
                 *tx_guard = Some(seek_tx);
             }
         });
@@ -686,16 +709,16 @@ pub fn run() -> anyhow::Result<()> {
 
     let state_seek = state.clone();
     ui.on_seek_track(move |progress| {
-        let tx_guard = state_seek.seek_tx.lock().unwrap();
+        let tx_guard = lock_mutex(&state_seek.seek_tx);
         if let Some(ref tx) = *tx_guard {
             let duration = {
-                let cp = state_seek.current_playback.lock().unwrap();
+                let cp = lock_mutex(&state_seek.current_playback);
                 cp.map(|(d, _)| d).unwrap_or(1.0)
             };
             let secs = duration * progress as f64;
             let _ = tx.send(secs);
 
-            let mut cp = state_seek.current_playback.lock().unwrap();
+            let mut cp = lock_mutex(&state_seek.current_playback);
             *cp = Some((duration, std::time::Instant::now() - std::time::Duration::from_secs_f64(secs)));
         }
     });
@@ -730,7 +753,7 @@ pub fn run() -> anyhow::Result<()> {
     let ui_state_sort = ui_state.clone();
     let sort_track_gen = search_generation.clone();
     ui.on_sort_tracks(move |column| {
-        let mut st = ui_state_sort.lock().unwrap();
+        let mut st = lock_mutex(&ui_state_sort);
         let col_str = column.to_string();
         if st.sort_column == col_str {
             st.sort_asc = !st.sort_asc;
@@ -745,7 +768,7 @@ pub fn run() -> anyhow::Result<()> {
         let db = state_sort.db.clone();
         let col_for_db = col.clone();
         std::thread::spawn(move || {
-            let db_lock = db.lock().unwrap();
+            let db_lock = lock_mutex(&db);
             let _ = db_lock.set_setting("sort_column", &col_for_db);
             let _ = db_lock.set_setting("sort_asc", if asc { "true" } else { "false" });
         });
@@ -762,7 +785,7 @@ pub fn run() -> anyhow::Result<()> {
     let ui_handle_folder_search = ui_weak.clone();
     let folder_search_gen = folder_search_generation.clone();
     ui.on_search_folders(move |query| {
-        let mut st = ui_state_folder_search.lock().unwrap();
+        let mut st = lock_mutex(&ui_state_folder_search);
         st.folder_search_query = query.to_string();
 
         update_folders_ui(&ui_handle_folder_search, &st, &folder_search_gen);

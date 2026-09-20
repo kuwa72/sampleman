@@ -278,10 +278,14 @@ impl<'a> Scanner<'a> {
     }
 
     fn extract_waveform(&self, format: &mut Box<dyn symphonia::core::formats::FormatReader>, track_id: u32) -> anyhow::Result<Vec<u8>> {
-        let mut decoder = symphonia::default::get_codecs().make(
-            &format.tracks().iter().find(|t| t.id == track_id).unwrap().codec_params,
-            &Default::default(),
-        )?;
+        let mut decoder = {
+            let track = format
+                .tracks()
+                .iter()
+                .find(|t| t.id == track_id)
+                .ok_or_else(|| anyhow::anyhow!("track id {track_id} not found in format tracks"))?;
+            symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?
+        };
 
         let mut waveform = Vec::new();
         let mut sample_count = 0;
