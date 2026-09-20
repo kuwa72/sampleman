@@ -24,6 +24,12 @@ pub struct AppState {
     seek_tx: Arc<Mutex<Option<crossbeam_channel::Sender<f64>>>>,
     playback_generation: Arc<std::sync::atomic::AtomicUsize>,
     is_scanning: Arc<std::sync::atomic::AtomicBool>,
+    /// Scan generation: bumped once per scan start and once per scan
+    /// completion. The progress-relay thread stamps events with the
+    /// generation at scan start and the UI closure skips stale ones, so a
+    /// queued event arriving after the completion update cannot flip
+    /// is_scanning back on.
+    scan_generation: Arc<std::sync::atomic::AtomicUsize>,
     /// Serializes all sink operations (stop/append/play) across play-worker
     /// threads and on_stop_track, closing the stop→recheck window where a
     /// stale thread could kill a newer generation's audio.
@@ -421,6 +427,7 @@ pub fn run() -> anyhow::Result<()> {
         seek_tx: Arc::new(Mutex::new(None)),
         playback_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         is_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        scan_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         playback_lock: Arc::new(Mutex::new(())),
     });
 
@@ -543,6 +550,14 @@ pub fn run() -> anyhow::Result<()> {
                 return;
             }
 
+            // Stamp this scan; relay events carry this generation and the UI
+            // closure skips stale ones, so a queued event arriving after the
+            // completion update cannot flip is_scanning back on.
+            let scan_gen = state
+                .scan_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+
             // WalkDir on a missing dir yields zero entries ("All files up to
             // date"), so check existence up front.
             if !Path::new(&path).is_dir() {
@@ -600,10 +615,15 @@ pub fn run() -> anyhow::Result<()> {
             let scanner = Scanner::new(&state.db);
 
             let ui_weak_progress = ui_weak.clone();
+            let state_progress = state.clone();
             std::thread::spawn(move || {
                 while let Ok(p) = progress_rx.recv() {
                     let ui_weak = ui_weak_progress.clone();
+                    let gen_state = state_progress.clone();
                     slint::invoke_from_event_loop(move || {
+                        if gen_state.scan_generation.load(std::sync::atomic::Ordering::SeqCst) != scan_gen {
+                            return;
+                        }
                         if let Some(ui) = ui_weak.upgrade() {
                             ui.set_is_scanning(true);
                             if p.total > 0 {
@@ -644,15 +664,30 @@ pub fn run() -> anyhow::Result<()> {
             update_tracks_ui(&ui_weak, &st, &s_gen);
 
             let status = match scan_result {
-                Ok(()) => SharedString::from("Scan Complete"),
+                Ok(report) => {
+                    if report.walk_errors > 0 {
+                        SharedString::from(format!(
+                            "Scan Complete: {} added/updated ({} unreadable entries skipped)",
+                            report.saved, report.walk_errors
+                        ))
+                    } else {
+                        SharedString::from(format!("Scan Complete: {} added/updated", report.saved))
+                    }
+                }
                 Err(e) => SharedString::from(format!("Scan failed: {}", e)),
             };
             let ui_weak_complete = ui_weak.clone();
+            let gen_state = state.clone();
             slint::invoke_from_event_loop(move || {
+                if gen_state.scan_generation.load(std::sync::atomic::Ordering::SeqCst) != scan_gen {
+                    return;
+                }
                 if let Some(ui) = ui_weak_complete.upgrade() {
                     ui.set_is_scanning(false);
                     ui.set_status_text(status);
                 }
+                // Invalidate any relay events still queued behind this update.
+                gen_state.scan_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }).ok();
             state
                 .is_scanning
