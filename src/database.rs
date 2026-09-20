@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Track {
@@ -21,6 +21,10 @@ pub struct Track {
     pub midi_channels: Option<String>,
     pub midi_programs: Option<String>,
     pub has_drums: Option<i64>,
+    pub bpm: Option<f32>,
+    pub musical_key: Option<String>,
+    pub instrument: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 pub struct TrackData {
@@ -40,6 +44,10 @@ pub struct TrackData {
     pub midi_channels: Option<String>,
     pub midi_programs: Option<String>,
     pub has_drums: Option<i64>,
+    pub bpm: Option<f32>,
+    pub musical_key: Option<String>,
+    pub instrument: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 pub struct Database {
@@ -81,7 +89,8 @@ impl Database {
         )?;
 
         // Simple migration for existing tables
-        let columns = ["sample_rate", "bit_depth", "channels", "comment", "midi_channels", "midi_programs", "has_drums"];
+        let columns = ["sample_rate", "bit_depth", "channels", "comment", "midi_channels", "midi_programs", "has_drums",
+            "bpm", "musical_key", "instrument", "content_hash"];
         for col in columns {
             let exists: bool = conn.query_row(
                 "SELECT count(*) FROM pragma_table_info('tracks') WHERE name=?",
@@ -91,7 +100,9 @@ impl Database {
 
             if !exists {
                 let type_str = match col {
-                    "comment" | "midi_channels" | "midi_programs" => "TEXT",
+                    "comment" | "midi_channels" | "midi_programs"
+                    | "musical_key" | "instrument" | "content_hash" => "TEXT",
+                    "bpm" => "REAL",
                     _ => "INTEGER",
                 };
                 conn.execute(&format!("ALTER TABLE tracks ADD COLUMN {} {}", col, type_str), [])?;
@@ -107,6 +118,15 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )",
+            [],
+        )?;
+
+        // Favorites: path-keyed flag (rating reserved for future use).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS favorites (
+                path TEXT PRIMARY KEY,
+                rating INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -150,8 +170,8 @@ impl Database {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tracks (path, mtime, size, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "INSERT INTO tracks (path, mtime, size, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums, bpm, musical_key, instrument, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(path) DO UPDATE SET
                     mtime = excluded.mtime,
                     size = excluded.size,
@@ -167,14 +187,19 @@ impl Database {
                     waveform = excluded.waveform,
                     midi_channels = excluded.midi_channels,
                     midi_programs = excluded.midi_programs,
-                    has_drums = excluded.has_drums"
+                    has_drums = excluded.has_drums,
+                    bpm = excluded.bpm,
+                    musical_key = excluded.musical_key,
+                    instrument = excluded.instrument,
+                    content_hash = excluded.content_hash"
             )?;
 
             for track in tracks {
                 stmt.execute(params![
                     track.path, track.mtime, track.size, track.title, track.artist, track.album, track.genre,
                     track.duration, track.sample_rate, track.bit_depth, track.channels, track.comment, track.waveform,
-                    track.midi_channels, track.midi_programs, track.has_drums
+                    track.midi_channels, track.midi_programs, track.has_drums,
+                    track.bpm, track.musical_key, track.instrument, track.content_hash
                 ])?;
             }
         }
@@ -200,6 +225,10 @@ impl Database {
             midi_channels: row.get(12)?,
             midi_programs: row.get(13)?,
             has_drums: row.get(14)?,
+            bpm: row.get(15)?,
+            musical_key: row.get(16)?,
+            instrument: row.get(17)?,
+            content_hash: row.get(18)?,
         })
     }
 
@@ -221,11 +250,15 @@ impl Database {
             midi_channels: row.get(13)?,
             midi_programs: row.get(14)?,
             has_drums: row.get(15)?,
+            bpm: row.get(16)?,
+            musical_key: row.get(17)?,
+            instrument: row.get(18)?,
+            content_hash: row.get(19)?,
         })
     }
 
     pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums FROM tracks WHERE path = ?")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums, bpm, musical_key, instrument, content_hash FROM tracks WHERE path = ?")?;
         let mut rows = stmt.query_map([path], |row| self.row_to_track(row))?;
 
         if let Some(track_res) = rows.next() {
@@ -235,7 +268,7 @@ impl Database {
     }
 
     pub fn get_all_tracks(&self) -> Result<Vec<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, midi_channels, midi_programs, has_drums FROM tracks ORDER BY path")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, midi_channels, midi_programs, has_drums, bpm, musical_key, instrument, content_hash FROM tracks ORDER BY path")?;
         let track_iter = stmt.query_map([], |row| self.row_to_track_no_waveform(row))?;
 
         let mut tracks = Vec::new();
@@ -278,5 +311,40 @@ impl Database {
             }
         }
         Ok(removed)
+    }
+
+    /// All favorited paths (rating column reserved; flag = row presence).
+    pub fn get_favorites(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM favorites")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(set)
+    }
+
+    /// Toggle favorite flag; returns the new state (true = now favorited).
+    pub fn toggle_favorite(&self, path: &str) -> Result<bool> {
+        let existed: bool = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM favorites WHERE path = ?",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if existed {
+            self.conn
+                .execute("DELETE FROM favorites WHERE path = ?", params![path])?;
+            Ok(false)
+        } else {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO favorites (path, rating) VALUES (?, 0)",
+                params![path],
+            )?;
+            Ok(true)
+        }
     }
 }

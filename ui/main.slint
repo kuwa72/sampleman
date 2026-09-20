@@ -12,6 +12,9 @@ export struct TrackData {
     bit_depth: string,
     channels: string,
     mtime: string,
+    bpm: string,
+    musical_key: string,
+    is_favorite: bool,
 }
 
 export struct FolderItem {
@@ -41,6 +44,7 @@ export component AppWindow inherits Window {
     callback seek-track(float);
     callback open-in-file-manager(string);
     callback sort-tracks(string);
+    callback toggle-favorite(string);
     callback search-folders(string);
     callback midi-mode-changed(string);
     callback midi-program-changed(string);
@@ -308,6 +312,25 @@ export component AppWindow inherits Window {
                             if root.current-sort-column == "channels" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
                         }
                     }
+                    TouchArea {
+                        width: 60px;
+                        clicked => { root.sort-tracks("bpm"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "BPM"; color: #888; }
+                            if root.current-sort-column == "bpm" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    TouchArea {
+                        width: 60px;
+                        clicked => { root.sort-tracks("key"); }
+                        HorizontalLayout {
+                            alignment: start;
+                            Text { text: "Key"; color: #888; }
+                            if root.current-sort-column == "key" : Text { text: root.current-sort-asc ? " ▲" : " ▼"; color: #888; }
+                        }
+                    }
+                    Text { text: "★"; color: #888; width: 30px; }
                 }
             }
 
@@ -366,6 +389,9 @@ export component AppWindow inherits Window {
                         Text { text: track.bit_depth; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
                         Text { text: track.sample_rate; color: i == selected-index ? #fff : #aaa; width: 100px; vertical-alignment: center; }
                         Text { text: track.channels; color: i == selected-index ? #fff : #aaa; width: 80px; vertical-alignment: center; }
+                        Text { text: track.bpm; color: i == selected-index ? #fff : #aaa; width: 60px; vertical-alignment: center; }
+                        Text { text: track.musical_key; color: i == selected-index ? #fff : #aaa; width: 60px; vertical-alignment: center; overflow: elide; }
+                        Text { text: track.is_favorite ? "★" : ""; color: #ffcc00; width: 30px; vertical-alignment: center; horizontal-alignment: center; }
                     }
                 }
             }
@@ -400,6 +426,11 @@ export component AppWindow inherits Window {
                             text: "Show Folder";
                             width: 110px;
                             clicked => { root.open-in-file-manager(root.tracks[root.selected-index].path); }
+                        }
+                        if root.selected-index >= 0 : Button {
+                            text: root.tracks[root.selected-index].is_favorite ? "★" : "☆";
+                            width: 45px;
+                            clicked => { root.toggle-favorite(root.tracks[root.selected-index].path); }
                         }
 
                         
