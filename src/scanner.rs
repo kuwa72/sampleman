@@ -21,7 +21,8 @@ pub struct ScanProgress {
 
 /// Stored waveform format version. Bump to force a one-time full rescan
 /// that regenerates waveforms saved in an older format.
-const WAVEFORM_VERSION: &str = "2";
+/// v3: adds MIDI summary columns (midi_channels/midi_programs/has_drums).
+const WAVEFORM_VERSION: &str = "3";
 /// Fixed number of peaks stored per track: whole-file coverage resampled
 /// by max-pooling (stereo/mono unified, DB size bounded).
 const WAVEFORM_PEAKS: usize = 1200;
