@@ -123,17 +123,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_track_metadata(&self, path: &str) -> Result<Option<(i64, i64)>> {
-        let mut stmt = self.conn.prepare("SELECT mtime, size FROM tracks WHERE path = ?")?;
-        let mut rows = stmt.query(params![path])?;
-        
-        if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?)))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn get_all_metadata(&self) -> Result<HashMap<String, (i64, i64)>> {
         let mut stmt = self.conn.prepare("SELECT path, mtime, size FROM tracks")?;
         let rows = stmt.query_map([], |row| {
@@ -146,31 +135,6 @@ impl Database {
             map.insert(path, meta);
         }
         Ok(map)
-    }
-
-    pub fn upsert_track(&self, data: TrackData) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO tracks (path, mtime, size, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(path) DO UPDATE SET
-                mtime = excluded.mtime,
-                size = excluded.size,
-                title = excluded.title,
-                artist = excluded.artist,
-                album = excluded.album,
-                genre = excluded.genre,
-                duration = excluded.duration,
-                sample_rate = excluded.sample_rate,
-                bit_depth = excluded.bit_depth,
-                channels = excluded.channels,
-                comment = excluded.comment,
-                waveform = excluded.waveform",
-            params![
-                data.path, data.mtime, data.size, data.title, data.artist, data.album, data.genre,
-                data.duration, data.sample_rate, data.bit_depth, data.channels, data.comment, data.waveform
-            ],
-        )?;
-        Ok(())
     }
 
     pub fn batch_upsert_tracks(&mut self, tracks: Vec<TrackData>) -> Result<()> {
@@ -203,16 +167,6 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn get_track_waveform(&self, id: i64) -> Result<Option<Vec<u8>>> {
-        let mut stmt = self.conn.prepare("SELECT waveform FROM tracks WHERE id = ?")?;
-        let mut rows = stmt.query(params![id])?;
-        if let Some(row) = rows.next()? {
-            Ok(row.get(0)?)
-        } else {
-            Ok(None)
-        }
     }
 
     fn row_to_track_no_waveform(&self, row: &rusqlite::Row) -> Result<Track> {
@@ -262,7 +216,7 @@ impl Database {
     }
 
     pub fn get_all_tracks(&self) -> Result<Vec<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment FROM tracks")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment FROM tracks ORDER BY path")?;
         let track_iter = stmt.query_map([], |row| self.row_to_track_no_waveform(row))?;
 
         let mut tracks = Vec::new();
@@ -272,11 +226,47 @@ impl Database {
         Ok(tracks)
     }
 
+    /// Escape LIKE wildcards so `prefix` matches literally.
+    fn escape_like(prefix: &str) -> String {
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    }
+
     pub fn remove_tracks_by_prefix(&self, prefix: &str) -> Result<()> {
+        let escaped = Self::escape_like(prefix);
         self.conn.execute(
-            "DELETE FROM tracks WHERE path LIKE ?",
-            params![format!("{}%", prefix)],
+            "DELETE FROM tracks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+            params![prefix, format!("{}/%", escaped)],
         )?;
         Ok(())
+    }
+
+    /// Delete tracks under `prefix` whose files no longer exist on disk.
+    /// Runs SELECT + DELETEs on this connection; call under one DB lock.
+    pub fn remove_missing_under(&self, prefix: &str) -> Result<usize> {
+        let escaped = Self::escape_like(prefix);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM tracks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+        let paths: Vec<String> = stmt
+            .query_map(params![prefix, format!("{}/%", escaped)], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        let mut removed = 0;
+        for p in paths {
+            // Component-aware match (defense in depth against LIKE edge cases).
+            if p != prefix && !Path::new(&p).starts_with(prefix) {
+                continue;
+            }
+            if !Path::new(&p).exists() {
+                removed += self
+                    .conn
+                    .execute("DELETE FROM tracks WHERE path = ?", params![p])?;
+            }
+        }
+        Ok(removed)
     }
 }
