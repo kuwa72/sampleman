@@ -42,7 +42,9 @@ impl SymphoniaSource {
         )?;
         let format = probed.format;
 
-        let track = format.tracks().get(0)
+        let track = format.tracks().iter()
+            .find(|t| t.codec_params.sample_rate.is_some() && t.codec_params.channels.is_some())
+            .or_else(|| format.tracks().get(0))
             .ok_or_else(|| anyhow::anyhow!("No tracks found in file"))?;
         let track_id = track.id;
         let codec_params = &track.codec_params;
@@ -72,10 +74,13 @@ impl Iterator for SymphoniaSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 1. Process seek requests
-        if let Ok(secs) = self.seek_rx.try_recv() {
+        // 1. Process seek requests (drain to the latest; rapid seeks queue up)
+        if let Some(secs) = self.seek_rx.try_iter().last() {
+            let secs = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
             let ts = symphonia::core::units::Time::new(secs as u64, secs.fract());
-            let _ = self.format.seek(SeekMode::Coarse, SeekTo::Time { time: ts, track_id: None });
+            if let Err(e) = self.format.seek(SeekMode::Coarse, SeekTo::Time { time: ts, track_id: None }) {
+                eprintln!("Symphonia seek failed ({}s): {}", secs, e);
+            }
             let _ = self.decoder.reset();
             self.sample_buf = None;
             self.buf_index = 0;
@@ -195,8 +200,9 @@ impl Iterator for MidiSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 1. Process seek requests
-        if let Ok(secs) = self.seek_rx.try_recv() {
+        // 1. Process seek requests (drain to the latest; rapid seeks queue up)
+        if let Some(secs) = self.seek_rx.try_iter().last() {
+            let secs = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
             // Re-play from start
             self.sequencer.play(&self.midi, false);
             
