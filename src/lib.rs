@@ -1092,6 +1092,9 @@ pub fn run() -> anyhow::Result<()> {
                     return;
                 }
                 if let Some(ui) = ui_handle.upgrade() {
+                    // Overwrite the "Loading ..." status set at play entry.
+                    let status_note =
+                        roll_note.unwrap_or_else(|| format!("Playing {}...", filename));
                     ui.set_current_track_name(SharedString::from(filename));
                     ui.set_current_track_info(SharedString::from(path_for_ui));
 
@@ -1102,9 +1105,7 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
 
-                    if let Some(note) = roll_note {
-                        ui.set_status_text(SharedString::from(note));
-                    }
+                    ui.set_status_text(SharedString::from(status_note));
 
                     ui.set_is_playing(true);
                     ui.set_play_progress(initial_progress as f32);
