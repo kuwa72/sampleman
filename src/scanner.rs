@@ -34,7 +34,8 @@ pub struct ScanReport {
 /// that regenerates waveforms saved in an older format.
 /// v3: adds MIDI summary columns (midi_channels/midi_programs/has_drums).
 /// v4: adds music meta columns (bpm/musical_key/instrument/content_hash).
-const WAVEFORM_VERSION: &str = "4";
+/// v5: content_hash switched to deterministic FNV-1a (v4 SipHash values churn).
+const WAVEFORM_VERSION: &str = "5";
 /// Fixed number of peaks stored per track: whole-file coverage resampled
 /// by max-pooling (stereo/mono unified, DB size bounded).
 const WAVEFORM_PEAKS: usize = 1200;
@@ -557,24 +558,32 @@ impl<'a> Scanner<'a> {
 /// Full-file hashing is too heavy for large samples at scan time.
 /// `None` on any I/O error (never fails the scan).
 fn content_hash_for(path: &Path, size: i64) -> Option<String> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     use std::io::{Read, Seek, SeekFrom};
     const WINDOW: u64 = 64 * 1024;
+    // FNV-1a 64: deterministic across runs/platforms (unlike DefaultHasher,
+    // whose SipHash keys are random per process, breaking cross-scan compare).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    mix(&size.to_le_bytes());
     let mut f = fs::File::open(path).ok()?;
-    let mut hasher = DefaultHasher::new();
-    size.hash(&mut hasher);
     let mut buf = vec![0u8; WINDOW as usize];
     let n = f.read(&mut buf).ok()?;
-    buf[..n].hash(&mut hasher);
+    mix(&buf[..n]);
     let len = size.max(0) as u64;
     if len > WINDOW {
         f.seek(SeekFrom::Start(len - WINDOW)).ok()?;
         let mut tail = Vec::new();
         f.take(WINDOW).read_to_end(&mut tail).ok()?;
-        tail.hash(&mut hasher);
+        mix(&tail);
     }
-    Some(format!("{:x}", hasher.finish()))
+    Some(format!("{:016x}", h))
 }
 
 /// Resamples fine peaks to exactly `target` entries covering the same
