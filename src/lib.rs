@@ -21,6 +21,7 @@ pub struct AppState {
     sink: Arc<Sink>,
     current_playback: Arc<Mutex<Option<(f64, std::time::Instant)>>>,
     seek_tx: Arc<Mutex<Option<crossbeam_channel::Sender<f64>>>>,
+    playback_generation: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct UiState {
@@ -357,6 +358,7 @@ pub fn run() -> anyhow::Result<()> {
         sink: sink.clone(),
         current_playback: Arc::new(Mutex::new(None)),
         seek_tx: Arc::new(Mutex::new(None)),
+        playback_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     let (initial_tracks, saved_folder, saved_col, saved_asc) = {
@@ -390,12 +392,18 @@ pub fn run() -> anyhow::Result<()> {
             if ui.get_is_playing() {
                 let playback = lock_mutex(&state_timer.current_playback);
                 if let Some((duration, start_time)) = *playback {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let progress = (elapsed / duration).min(1.0) as f32;
-                    ui.set_play_progress(progress);
-                    if progress >= 1.0 {
-                        ui.set_is_playing(false);
+                    if !duration.is_finite() || duration <= 0.0 {
+                        ui.set_play_progress(0.0);
+                    } else {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        let progress = (elapsed / duration).min(1.0) as f32;
+                        ui.set_play_progress(progress);
+                        if progress >= 1.0 || state_timer.sink.empty() {
+                            ui.set_is_playing(false);
+                        }
                     }
+                } else if state_timer.sink.empty() {
+                    ui.set_is_playing(false);
                 }
             }
         }
@@ -601,78 +609,144 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         std::thread::spawn(move || {
+            let my_gen = state.playback_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let is_latest = || state.playback_generation.load(std::sync::atomic::Ordering::SeqCst) == my_gen;
+            let initial_progress = if initial_progress.is_finite() {
+                initial_progress.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
             let track = {
                 let db = lock_mutex(&state.db);
                 db.get_track_by_path(&path_str).ok().flatten()
             };
 
-            if let Some(t) = track {
-                let waveform_data = t.waveform.clone();
-                let filename = Path::new(&path_str)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path_str.clone());
-
-                let duration = t.duration;
-                let path_for_ui = path_str.clone();
-                let (width, height, pixels) = create_waveform_pixels(&waveform_data.unwrap_or_default());
-
+            let Some(t) = track else {
+                if !is_latest() {
+                    return;
+                }
+                let msg = SharedString::from(format!("File not found in library: {}", path_str));
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle.upgrade() {
-                        ui.set_current_track_name(SharedString::from(filename));
-                        ui.set_current_track_info(SharedString::from(path_for_ui));
-                        
-                        let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-                        let dest = pixel_buffer.make_mut_bytes();
-                        if dest.len() == pixels.len() {
-                            dest.copy_from_slice(&pixels);
-                        }
-                        ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
-                        
-                        ui.set_is_playing(true);
-                        ui.set_play_progress(initial_progress as f32);
+                        ui.set_is_playing(false);
+                        ui.set_status_text(msg);
                     }
                 }).ok();
+                return;
+            };
 
-                {
-                    let mut cp = lock_mutex(&state.current_playback);
-                    let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(duration * initial_progress);
-                    *cp = Some((duration, start_time));
+            let duration = t.duration;
+            let waveform_data = t.waveform.clone();
+            let filename = Path::new(&path_str)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_str.clone());
+
+            // Create the audio source BEFORE touching UI/playback state so a
+            // failure cannot leave `is_playing=true` stuck on.
+            let (seek_tx, seek_rx) = crossbeam_channel::unbounded::<f64>();
+            let ext = Path::new(&path_str).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+            let source = if ext == "mid" || ext == "midi" {
+                match crate::audio::MidiSource::new(&path_str, seek_rx) {
+                    Ok(s) => crate::audio::DynamicSource::Midi(s),
+                    Err(e) => {
+                        eprintln!("Failed to create MidiSource: {}", e);
+                        if !is_latest() {
+                            return;
+                        }
+                        let msg = SharedString::from(format!("Playback failed: {}", e));
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_handle.upgrade() {
+                                ui.set_is_playing(false);
+                                ui.set_status_text(msg);
+                            }
+                        }).ok();
+                        return;
+                    }
                 }
-
-                let (seek_tx, seek_rx) = crossbeam_channel::unbounded::<f64>();
-                let ext = Path::new(&path_str).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                
-                let source = if ext == "mid" || ext == "midi" {
-                    match crate::audio::MidiSource::new(&path_str, seek_rx) {
-                        Ok(s) => crate::audio::DynamicSource::Midi(s),
-                        Err(e) => {
-                            eprintln!("Failed to create MidiSource: {}", e);
+            } else {
+                match crate::audio::SymphoniaSource::new(&path_str, seek_rx) {
+                    Ok(s) => crate::audio::DynamicSource::Symphonia(s),
+                    Err(e) => {
+                        eprintln!("Failed to create SymphoniaSource: {}", e);
+                        if !is_latest() {
                             return;
                         }
+                        let msg = SharedString::from(format!("Playback failed: {}", e));
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_handle.upgrade() {
+                                ui.set_is_playing(false);
+                                ui.set_status_text(msg);
+                            }
+                        }).ok();
+                        return;
                     }
-                } else {
-                    match crate::audio::SymphoniaSource::new(&path_str, seek_rx) {
-                        Ok(s) => crate::audio::DynamicSource::Symphonia(s),
-                        Err(e) => {
-                            eprintln!("Failed to create SymphoniaSource: {}", e);
-                            return;
-                        }
-                    }
-                };
+                }
+            };
 
-                if initial_progress > 0.0 {
-                    let secs = duration * initial_progress;
+            // A newer play request supersedes this one: skip sink/state updates.
+            if !is_latest() {
+                return;
+            }
+
+            if initial_progress > 0.0 && duration.is_finite() && duration > 0.0 {
+                let secs = duration * initial_progress;
+                if secs.is_finite() && secs >= 0.0 {
                     let _ = seek_tx.send(secs);
                 }
-
-                state.sink.stop();
-                state.sink.append(source);
-                state.sink.play();
-
-                let mut tx_guard = lock_mutex(&state.seek_tx);
-                *tx_guard = Some(seek_tx);
             }
+
+            state.sink.stop();
+            // Recheck after the (possibly slow) sink stop: another play may
+            // have started while we were blocked.
+            if !is_latest() {
+                return;
+            }
+            state.sink.append(source);
+            state.sink.play();
+
+            {
+                let mut cp = lock_mutex(&state.current_playback);
+                // Guard Duration::from_secs_f64 (panics on negative/NaN).
+                let offset = duration * initial_progress;
+                let offset = if offset.is_finite() && offset > 0.0 { offset } else { 0.0 };
+                let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(offset);
+                *cp = Some((duration, start_time));
+            }
+
+            {
+                let mut tx_guard = lock_mutex(&state.seek_tx);
+                // Only the latest play owns the seek channel.
+                if is_latest() {
+                    *tx_guard = Some(seek_tx);
+                }
+            }
+
+            let path_for_ui = path_str.clone();
+            let (width, height, pixels) = create_waveform_pixels(&waveform_data.unwrap_or_default());
+            let gen_for_ui = state.playback_generation.clone();
+
+            slint::invoke_from_event_loop(move || {
+                if gen_for_ui.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                    return;
+                }
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_current_track_name(SharedString::from(filename));
+                    ui.set_current_track_info(SharedString::from(path_for_ui));
+
+                    let mut pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
+                    let dest = pixel_buffer.make_mut_bytes();
+                    if dest.len() == pixels.len() {
+                        dest.copy_from_slice(&pixels);
+                    }
+                    ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
+
+                    ui.set_is_playing(true);
+                    ui.set_play_progress(initial_progress as f32);
+                }
+            }).ok();
         });
     });
 
@@ -709,14 +783,23 @@ pub fn run() -> anyhow::Result<()> {
 
     let state_seek = state.clone();
     ui.on_seek_track(move |progress| {
-        let tx_guard = lock_mutex(&state_seek.seek_tx);
-        if let Some(ref tx) = *tx_guard {
+        // Copy the sender out first, then drop the guard before touching
+        // `current_playback` (fixed lock ordering: never hold `seek_tx`
+        // while acquiring `current_playback`).
+        let tx_opt = { lock_mutex(&state_seek.seek_tx).clone() };
+        if let Some(tx) = tx_opt {
             let duration = {
                 let cp = lock_mutex(&state_seek.current_playback);
                 cp.map(|(d, _)| d).unwrap_or(1.0)
             };
-            let secs = duration * progress as f64;
-            let _ = tx.send(secs);
+            let progress_f = progress as f64;
+            let progress_f = if progress_f.is_finite() { progress_f.clamp(0.0, 1.0) } else { 0.0 };
+            let raw_secs = duration * progress_f;
+            // Guard Duration::from_secs_f64 (panics on negative/NaN).
+            let secs = if raw_secs.is_finite() && raw_secs >= 0.0 { raw_secs } else { 0.0 };
+            if let Err(e) = tx.send(secs) {
+                eprintln!("Failed to send seek request ({}s): {}", secs, e);
+            }
 
             let mut cp = lock_mutex(&state_seek.current_playback);
             *cp = Some((duration, std::time::Instant::now() - std::time::Duration::from_secs_f64(secs)));
