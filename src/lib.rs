@@ -22,6 +22,7 @@ pub struct AppState {
     current_playback: Arc<Mutex<Option<(f64, std::time::Instant)>>>,
     seek_tx: Arc<Mutex<Option<crossbeam_channel::Sender<f64>>>>,
     playback_generation: Arc<std::sync::atomic::AtomicUsize>,
+    is_scanning: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct UiState {
@@ -156,7 +157,7 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
 fn get_filtered_track_indices(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<usize> {
     let mut filtered: Vec<(usize, i64)> = tracks.par_iter()
         .enumerate()
-        .filter(|(_, t)| folder.is_empty() || t.path.starts_with(folder))
+        .filter(|(_, t)| folder.is_empty() || Path::new(&t.path).starts_with(folder))
         .filter_map(|(idx, t)| {
             if query.is_empty() {
                 return Some((idx, 0));
@@ -359,6 +360,7 @@ pub fn run() -> anyhow::Result<()> {
         current_playback: Arc::new(Mutex::new(None)),
         seek_tx: Arc::new(Mutex::new(None)),
         playback_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        is_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     let (initial_tracks, saved_folder, saved_col, saved_asc) = {
@@ -432,47 +434,97 @@ pub fn run() -> anyhow::Result<()> {
         let f_gen = scan_folder_gen.clone();
         let path_str = path_arg.to_string();
 
-        let is_add_library = path_str.is_empty();
-        let path = if is_add_library {
-            println!("Add Library: opening FileDialog...");
-            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                folder.to_string_lossy().to_string()
+        // Open the folder dialog off the UI thread so the event loop never blocks.
+        std::thread::spawn(move || {
+            let is_add_library = path_str.is_empty();
+            let path = if is_add_library {
+                println!("Add Library: opening FileDialog...");
+                match rfd::FileDialog::new().pick_folder() {
+                    Some(folder) => folder.to_string_lossy().to_string(),
+                    None => return,
+                }
             } else {
+                println!("Rescanning folder: {}", path_str);
+                path_str
+            };
+
+            // Double-scan guard: only one scan runs at a time.
+            if state
+                .is_scanning
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                let ui_weak = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_status_text("Scan already in progress".into());
+                    }
+                })
+                .ok();
                 return;
             }
-        } else {
-            println!("Rescanning folder: {}", path_str);
-            path_str
-        };
 
-        if let Some(ui) = ui_handle_scan.upgrade() {
-            ui.set_is_scanning(true);
-            ui.set_scan_progress(0.0);
-            ui.set_status_text("Indexing directory files...".into());
-        }
-
-        if is_add_library {
-            let path_for_db = path.clone();
-            let db = state.db.clone();
-            {
-                let mut st = lock_mutex(&ui_state);
-                st.selected_folder = path.clone();
-                st.expanded_folders.insert(path.clone());
+            // WalkDir on a missing dir yields zero entries ("All files up to
+            // date"), so check existence up front.
+            if !Path::new(&path).is_dir() {
+                let msg = format!("Folder not found: {}", path);
+                let ui_weak = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_status_text(msg.into());
+                    }
+                })
+                .ok();
+                state
+                    .is_scanning
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
             }
-            if let Some(ui) = ui_handle_scan.upgrade() {
-                ui.set_selected_folder(SharedString::from(&path));
-            }
-            std::thread::spawn(move || {
-                let db_lock = lock_mutex(&db);
-                let _ = db_lock.set_setting("selected_folder", &path_for_db);
-            });
-        }
 
-        std::thread::spawn(move || {
+            if is_add_library {
+                {
+                    let mut st = lock_mutex(&ui_state);
+                    st.selected_folder = path.clone();
+                    st.expanded_folders.insert(path.clone());
+                }
+                let path_for_ui = path.clone();
+                let ui_weak = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_selected_folder(SharedString::from(&path_for_ui));
+                        ui.set_is_scanning(true);
+                        ui.set_scan_progress(0.0);
+                        ui.set_status_text("Indexing directory files...".into());
+                    }
+                })
+                .ok();
+                let path_for_db = path.clone();
+                let db = state.db.clone();
+                {
+                    let db_lock = lock_mutex(&db);
+                    let _ = db_lock.set_setting("selected_folder", &path_for_db);
+                }
+            } else {
+                let ui_weak = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_is_scanning(true);
+                        ui.set_scan_progress(0.0);
+                        ui.set_status_text("Indexing directory files...".into());
+                    }
+                })
+                .ok();
+            }
+
             println!("Scan thread spawned for {}", path);
             let (progress_tx, progress_rx) = crossbeam_channel::unbounded::<ScanProgress>();
             let scanner = Scanner::new(&state.db);
-            
+
             let ui_weak_progress = ui_weak.clone();
             std::thread::spawn(move || {
                 while let Ok(p) = progress_rx.recv() {
@@ -493,29 +545,44 @@ pub fn run() -> anyhow::Result<()> {
             });
 
             println!("Calling scan_directory...");
-            if let Err(e) = scanner.scan_directory(path, progress_tx) {
+            let scan_result = scanner.scan_directory(&path, progress_tx);
+            if let Err(ref e) = scan_result {
                 eprintln!("Scan error: {}", e);
             }
             println!("scan_directory finished. Querying matching tracks for sub-renders...");
-            let tracks = {
+            // GC stale records + reload, under a single DB lock.
+            let (tracks, gc_removed) = {
                 let db = lock_mutex(&state.db);
-                db.get_all_tracks().unwrap_or_default()
+                let gc_removed = db.remove_missing_under(&path).unwrap_or(0);
+                let tracks = db.get_all_tracks().unwrap_or_default();
+                (tracks, gc_removed)
             };
-            println!("Tracks total after load: {}", tracks.len());
-            
+            println!(
+                "Tracks total after load: {} (gc removed {})",
+                tracks.len(),
+                gc_removed
+            );
+
             let mut st = lock_mutex(&ui_state);
             st.all_tracks = Arc::new(tracks); // Update cache!
-            
+
             update_folders_ui(&ui_weak, &st, &f_gen);
             update_tracks_ui(&ui_weak, &st, &s_gen);
-            
+
+            let status = match scan_result {
+                Ok(()) => SharedString::from("Scan Complete"),
+                Err(e) => SharedString::from(format!("Scan failed: {}", e)),
+            };
             let ui_weak_complete = ui_weak.clone();
             slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak_complete.upgrade() {
                     ui.set_is_scanning(false);
-                    ui.set_status_text("Scan Complete".into());
+                    ui.set_status_text(status);
                 }
             }).ok();
+            state
+                .is_scanning
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         });
     });
 
