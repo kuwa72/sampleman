@@ -9,8 +9,10 @@ use std::fs::File;
 use rodio::Source;
 use rustysynth::{Synthesizer, SynthesizerSettings, SoundFont, MidiFile, MidiFileSequencer};
 use std::sync::Arc;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::env;
+
+pub use crate::midi_util::MidiPlayOptions;
 
 pub struct SymphoniaSource {
     format: Box<dyn FormatReader>,
@@ -151,7 +153,7 @@ pub struct MidiSource {
 }
 
 impl MidiSource {
-    pub fn new<P: AsRef<Path>>(path: P, seek_rx: crossbeam_channel::Receiver<f64>) -> anyhow::Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P, seek_rx: crossbeam_channel::Receiver<f64>, options: MidiPlayOptions) -> anyhow::Result<Self> {
         let soundfont_path = "soundfont.sf2"; // Fallback in current dir
         
         // Try current dir first, then look in exe dir
@@ -175,8 +177,16 @@ impl MidiSource {
         let settings = SynthesizerSettings::new(44100);
         let synthesizer = Synthesizer::new(&soundfont, &settings).map_err(|e| anyhow::anyhow!("Failed to create synthesizer: {:?}", e))?;
         
-        let file = File::open(path.as_ref())?;
-        let mut midi_reader = BufReader::new(file);
+        let file_bytes = std::fs::read(path.as_ref())?;
+        // Rewrite channels / force program via midly, then hand the bytes
+        // to rustysynth. On rewrite failure fall back to the raw file so
+        // playback still works.
+        let play_bytes = crate::midi_util::remap_for_playback(&file_bytes, options.mode, options.program)
+            .unwrap_or_else(|e| {
+                eprintln!("MIDI remap failed, playing as-is: {}", e);
+                file_bytes
+            });
+        let mut midi_reader = Cursor::new(play_bytes);
         let midi = MidiFile::new(&mut midi_reader).map_err(|e| anyhow::anyhow!("Failed to load MIDI file: {:?}", e))?;
         let midi_arc = Arc::new(midi);
         

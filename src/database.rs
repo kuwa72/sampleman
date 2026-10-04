@@ -18,6 +18,9 @@ pub struct Track {
     pub channels: Option<u16>,
     pub comment: Option<String>,
     pub waveform: Option<Vec<u8>>,
+    pub midi_channels: Option<String>,
+    pub midi_programs: Option<String>,
+    pub has_drums: Option<i64>,
 }
 
 pub struct TrackData {
@@ -34,6 +37,9 @@ pub struct TrackData {
     pub channels: Option<u16>,
     pub comment: Option<String>,
     pub waveform: Option<Vec<u8>>,
+    pub midi_channels: Option<String>,
+    pub midi_programs: Option<String>,
+    pub has_drums: Option<i64>,
 }
 
 pub struct Database {
@@ -75,7 +81,7 @@ impl Database {
         )?;
 
         // Simple migration for existing tables
-        let columns = ["sample_rate", "bit_depth", "channels", "comment"];
+        let columns = ["sample_rate", "bit_depth", "channels", "comment", "midi_channels", "midi_programs", "has_drums"];
         for col in columns {
             let exists: bool = conn.query_row(
                 "SELECT count(*) FROM pragma_table_info('tracks') WHERE name=?",
@@ -84,7 +90,10 @@ impl Database {
             ).unwrap_or(0) > 0;
 
             if !exists {
-                let type_str = if col == "comment" { "TEXT" } else { "INTEGER" };
+                let type_str = match col {
+                    "comment" | "midi_channels" | "midi_programs" => "TEXT",
+                    _ => "INTEGER",
+                };
                 conn.execute(&format!("ALTER TABLE tracks ADD COLUMN {} {}", col, type_str), [])?;
             }
         }
@@ -141,8 +150,8 @@ impl Database {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tracks (path, mtime, size, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "INSERT INTO tracks (path, mtime, size, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(path) DO UPDATE SET
                     mtime = excluded.mtime,
                     size = excluded.size,
@@ -155,13 +164,17 @@ impl Database {
                     bit_depth = excluded.bit_depth,
                     channels = excluded.channels,
                     comment = excluded.comment,
-                    waveform = excluded.waveform"
+                    waveform = excluded.waveform,
+                    midi_channels = excluded.midi_channels,
+                    midi_programs = excluded.midi_programs,
+                    has_drums = excluded.has_drums"
             )?;
 
             for track in tracks {
                 stmt.execute(params![
                     track.path, track.mtime, track.size, track.title, track.artist, track.album, track.genre,
-                    track.duration, track.sample_rate, track.bit_depth, track.channels, track.comment, track.waveform
+                    track.duration, track.sample_rate, track.bit_depth, track.channels, track.comment, track.waveform,
+                    track.midi_channels, track.midi_programs, track.has_drums
                 ])?;
             }
         }
@@ -184,6 +197,9 @@ impl Database {
             channels: row.get(10)?,
             comment: row.get(11)?,
             waveform: None,
+            midi_channels: row.get(12)?,
+            midi_programs: row.get(13)?,
+            has_drums: row.get(14)?,
         })
     }
 
@@ -202,11 +218,14 @@ impl Database {
             channels: row.get(10)?,
             comment: row.get(11)?,
             waveform: row.get(12)?,
+            midi_channels: row.get(13)?,
+            midi_programs: row.get(14)?,
+            has_drums: row.get(15)?,
         })
     }
 
     pub fn get_track_by_path(&self, path: &str) -> Result<Option<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform FROM tracks WHERE path = ?")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, waveform, midi_channels, midi_programs, has_drums FROM tracks WHERE path = ?")?;
         let mut rows = stmt.query_map([path], |row| self.row_to_track(row))?;
 
         if let Some(track_res) = rows.next() {
@@ -216,7 +235,7 @@ impl Database {
     }
 
     pub fn get_all_tracks(&self) -> Result<Vec<Track>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment FROM tracks ORDER BY path")?;
+        let mut stmt = self.conn.prepare("SELECT id, path, mtime, title, artist, album, genre, duration, sample_rate, bit_depth, channels, comment, midi_channels, midi_programs, has_drums FROM tracks ORDER BY path")?;
         let track_iter = stmt.query_map([], |row| self.row_to_track_no_waveform(row))?;
 
         let mut tracks = Vec::new();
