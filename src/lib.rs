@@ -503,6 +503,14 @@ pub fn run() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     let ui_weak = ui.as_weak();
 
+    #[cfg(target_os = "windows")]
+    {
+        use i_slint_backend_winit::WinitWindowAccessor;
+        let _ = ui.window().with_winit_window(|winit_window| {
+            set_window_icon_from_exe_resource(winit_window);
+        });
+    }
+
     let state = Arc::new(AppState {
         db: db.clone(),
         sink: sink.clone(),
@@ -1390,4 +1398,58 @@ pub fn run() -> anyhow::Result<()> {
 
     ui.run()?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_window_icon_from_exe_resource(winit_window: &winit::window::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let hwnd = match winit_window.window_handle() {
+        Ok(handle) => match handle.as_raw() {
+            RawWindowHandle::Win32(win32) => win32.hwnd.get() as *mut std::ffi::c_void,
+            _ => return,
+        },
+        Err(_) => return,
+    };
+
+    extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> *mut std::ffi::c_void;
+        fn LoadImageW(
+            instance: *mut std::ffi::c_void,
+            name: *const u16,
+            image_type: u32,
+            cx_desired: i32,
+            cy_desired: i32,
+            load: u32,
+        ) -> *mut std::ffi::c_void;
+        fn SendMessageW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            w_param: usize,
+            l_param: isize,
+        ) -> isize;
+    }
+
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x00000040;
+    const LR_SHARED: u32 = 0x00008000;
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_SMALL: usize = 0;
+    const ICON_BIG: usize = 1;
+
+    unsafe {
+        let instance = GetModuleHandleW(std::ptr::null());
+        let icon = LoadImageW(
+            instance,
+            1 as *const u16,
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        );
+        if !icon.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon as isize);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon as isize);
+        }
+    }
 }
