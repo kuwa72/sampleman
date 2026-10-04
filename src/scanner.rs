@@ -19,6 +19,13 @@ pub struct ScanProgress {
     pub stage: String, // "Scanning" | "Analyzing" | "Saving"
 }
 
+/// Outcome counts for one `scan_directory` run, surfaced in the UI status.
+pub struct ScanReport {
+    pub saved: usize,
+    pub walk_errors: usize,
+    pub failed_batches: usize,
+}
+
 /// Stored waveform format version. Bump to force a one-time full rescan
 /// that regenerates waveforms saved in an older format.
 /// v3: adds MIDI summary columns (midi_channels/midi_programs/has_drums).
@@ -38,7 +45,7 @@ impl<'a> Scanner<'a> {
         Self { db }
     }
 
-    pub fn scan_directory<P: AsRef<Path>>(&self, dir: P, progress_tx: crossbeam_channel::Sender<ScanProgress>) -> anyhow::Result<()> 
+    pub fn scan_directory<P: AsRef<Path>>(&self, dir: P, progress_tx: crossbeam_channel::Sender<ScanProgress>) -> anyhow::Result<ScanReport> 
     {
         use rayon::prelude::*;
         use std::collections::HashMap;
@@ -65,9 +72,17 @@ impl<'a> Scanner<'a> {
             db.get_setting("waveform_version")?.as_deref() != Some(WAVEFORM_VERSION)
         };
 
+        let mut walk_errors: usize = 0;
         let entries: Vec<_> = WalkDir::new(dir)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    walk_errors += 1;
+                    eprintln!("Scan walk error: {}", err);
+                    None
+                }
+            })
             .filter(|e| e.file_type().is_file() && self.is_audio_file(e.path()))
             .filter_map(|e| {
                 let path = e.path();
@@ -107,11 +122,16 @@ impl<'a> Scanner<'a> {
                     eprintln!("Failed to persist waveform_version: {}", e);
                 }
             }
-            return Ok(());
+            if walk_errors > 0 {
+                return Err(anyhow::anyhow!("{walk_errors} unreadable entries skipped, no files scanned"));
+            }
+            return Ok(ScanReport { saved: 0, walk_errors: 0, failed_batches: 0 });
         }
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let scanner_ref = self;
+        let mut saved: usize = 0;
+        let mut failed_batches: usize = 0;
 
         rayon::scope(|s| {
             // Spawn parallel analysis in the background of the scope
@@ -143,9 +163,19 @@ impl<'a> Scanner<'a> {
                     
                     if batch.len() >= 50 {
                         println!("Saving batch of {} files...", batch.len());
-                        if let Ok(mut db) = scanner_ref.db.lock() {
-                            if let Err(e) = db.batch_upsert_tracks(std::mem::take(&mut batch)) {
-                                eprintln!("Database batch upsert error: {}", e);
+                        let pending = std::mem::take(&mut batch);
+                        let n = pending.len();
+                        match scanner_ref.db.lock() {
+                            Ok(mut db) => match db.batch_upsert_tracks(pending) {
+                                Ok(()) => saved += n,
+                                Err(e) => {
+                                    failed_batches += 1;
+                                    eprintln!("Database batch upsert error: {}", e);
+                                }
+                            },
+                            Err(e) => {
+                                failed_batches += 1;
+                                eprintln!("Database lock error during batch upsert: {}", e);
                             }
                         }
                         println!("Batch saved.");
@@ -180,9 +210,18 @@ impl<'a> Scanner<'a> {
             // Final batch
             if !batch.is_empty() {
                 println!("Saving final batch of {} files...", batch.len());
-                if let Ok(mut db) = scanner_ref.db.lock() {
-                    if let Err(e) = db.batch_upsert_tracks(batch) {
-                        eprintln!("Database final batch upsert error: {}", e);
+                let n = batch.len();
+                match scanner_ref.db.lock() {
+                    Ok(mut db) => match db.batch_upsert_tracks(batch) {
+                        Ok(()) => saved += n,
+                        Err(e) => {
+                            failed_batches += 1;
+                            eprintln!("Database final batch upsert error: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        failed_batches += 1;
+                        eprintln!("Database lock error during final batch upsert: {}", e);
                     }
                 }
                 println!("Final batch saved.");
@@ -196,7 +235,16 @@ impl<'a> Scanner<'a> {
             }
         }
 
-        Ok(())
+        if failed_batches > 0 {
+            let walk_note = if walk_errors > 0 {
+                format!(" ({} unreadable entries skipped)", walk_errors)
+            } else {
+                String::new()
+            };
+            return Err(anyhow::anyhow!("{failed_batches} batch(es) failed to save{walk_note}"));
+        }
+
+        Ok(ScanReport { saved, walk_errors, failed_batches: 0 })
     }
 
     fn is_audio_file(&self, path: &Path) -> bool {

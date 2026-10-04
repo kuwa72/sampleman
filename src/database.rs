@@ -253,15 +253,6 @@ impl Database {
             .replace('_', "\\_")
     }
 
-    pub fn remove_tracks_by_prefix(&self, prefix: &str) -> Result<()> {
-        let escaped = Self::escape_like(prefix);
-        self.conn.execute(
-            "DELETE FROM tracks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-            params![prefix, format!("{}/%", escaped)],
-        )?;
-        Ok(())
-    }
-
     /// Delete tracks under `prefix` whose files no longer exist on disk.
     /// Runs SELECT + DELETEs on this connection; call under one DB lock.
     pub fn remove_missing_under(&self, prefix: &str) -> Result<usize> {
