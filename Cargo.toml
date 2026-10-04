@@ -1,9 +1,12 @@
 [package]
 name = "sampleman"
 version = "0.1.0"
-description = "Ready-Rev: Modern Music Library Manager"
-authors = ["you"]
+description = "Cross-platform sample/audio library manager for DTM production"
+authors = ["KUWASHIMA Yuichiro <ykuwashima@gmail.com>"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/kuwa72/sampleman"
+homepage = "https://github.com/kuwa72/sampleman"
 
 [build-dependencies]
 slint-build = "=1.7.0"
