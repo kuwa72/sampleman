@@ -109,20 +109,29 @@ impl<'a> Scanner<'a> {
             let path = entry.path();
             let path_str = path.to_string_lossy().to_string();
 
-            if let Ok(metadata) = fs::metadata(path) {
-                let mtime = metadata.modified()
-                    .ok()
-                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
-                let size = metadata.len() as i64;
+            match fs::metadata(path) {
+                Ok(metadata) => {
+                    let mtime = metadata.modified()
+                        .ok()
+                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
 
-                if let Some(mtime) = mtime {
-                    if let Some(&(db_mtime, db_size)) = existing_meta.get(&path_str) {
-                        if !waveform_stale && db_mtime == mtime && db_size == size {
-                            continue;
+                    if let Some(mtime) = mtime {
+                        let size = metadata.len() as i64;
+                        if let Some(&(db_mtime, db_size)) = existing_meta.get(&path_str) {
+                            if !waveform_stale && db_mtime == mtime && db_size == size {
+                                continue;
+                            }
                         }
+                        entries.push((path.to_path_buf(), path_str, mtime, size));
+                    } else {
+                        walk_errors += 1;
+                        eprintln!("Scan mtime error for: {}", path_str);
                     }
-                    entries.push((path.to_path_buf(), path_str, mtime, size));
+                }
+                Err(err) => {
+                    walk_errors += 1;
+                    eprintln!("Scan metadata error for {}: {}", path_str, err);
                 }
             }
             if index_emit.elapsed() >= std::time::Duration::from_millis(500) {
@@ -155,13 +164,13 @@ impl<'a> Scanner<'a> {
                 path: "All files up to date".into(),
                 stage: "Done".into(),
             }).ok();
+            if walk_errors > 0 {
+                return Err(anyhow::anyhow!("{walk_errors} unreadable entries skipped, no files scanned"));
+            }
             if let Ok(db) = self.db.lock() {
                 if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
                     eprintln!("Failed to persist waveform_version: {}", e);
                 }
-            }
-            if walk_errors > 0 {
-                return Err(anyhow::anyhow!("{walk_errors} unreadable entries skipped, no files scanned"));
             }
             return Ok(ScanReport {
                 saved: 0,
@@ -174,8 +183,6 @@ impl<'a> Scanner<'a> {
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let scanner_ref = self;
-        let mut saved: usize = 0;
-        let mut failed_batches: usize = 0;
 
         // Hoisted out of the scope closure so the report below can carry them.
         let mut saved: usize = 0;
@@ -299,17 +306,6 @@ impl<'a> Scanner<'a> {
             }
         });
 
-        // Waveforms are now current; the next scan resumes incremental behavior.
-        // Skipped on cancel: un-analyzed files keep old-format waveforms, so
-        // the version must stay stale to force a full rescan next time.
-        if !cancelled {
-            if let Ok(db) = self.db.lock() {
-                if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
-                    eprintln!("Failed to persist waveform_version: {}", e);
-                }
-            }
-        }
-
         if failed_batches > 0 {
             let walk_note = if walk_errors > 0 {
                 format!(" ({} unreadable entries skipped)", walk_errors)
@@ -317,6 +313,18 @@ impl<'a> Scanner<'a> {
                 String::new()
             };
             return Err(anyhow::anyhow!("{failed_batches} batch(es) failed to save{walk_note}"));
+        }
+
+        // Waveforms are now current; the next scan resumes incremental behavior.
+        // Only persist version on a fully successful scan: cancelled runs or
+        // scans with walk errors / failed batches keep the version stale to
+        // force a full rescan next time.
+        if !cancelled && walk_errors == 0 {
+            if let Ok(db) = self.db.lock() {
+                if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
+                    eprintln!("Failed to persist waveform_version: {}", e);
+                }
+            }
         }
 
         Ok(ScanReport {
