@@ -43,6 +43,7 @@ export component AppWindow inherits Window {
     callback search-folders(string);
     callback midi-mode-changed(string);
     callback midi-program-changed(string);
+    callback sidebar-width-changed(length);
 
 
     in-out property <[TrackData]> tracks: [];
@@ -208,6 +209,7 @@ export component AppWindow inherits Window {
                 moved => {
                     if (sidebar-width + self.mouse-x > 150px && sidebar-width + self.mouse-x < 500px) {
                         sidebar-width = sidebar-width + self.mouse-x;
+                        root.sidebar-width-changed(sidebar-width);
                     }
                 }
             }

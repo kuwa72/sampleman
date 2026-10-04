@@ -62,6 +62,54 @@ fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Max number of expanded-folder entries kept in the `expanded_folders`
+/// setting, bounding the settings row size for large libraries.
+const MAX_EXPANDED_FOLDERS: usize = 500;
+
+fn serialize_expanded_folders(expanded: &HashSet<String>) -> String {
+    let mut v: Vec<String> = expanded.iter().cloned().collect();
+    v.sort();
+    if v.len() > MAX_EXPANDED_FOLDERS {
+        v.truncate(MAX_EXPANDED_FOLDERS);
+    }
+    serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Persist the expanded-folder set off the UI thread (spawn + lock +
+/// set_setting, same pattern as the other settings writes).
+fn persist_expanded_folders(db: Arc<Mutex<Database>>, expanded: HashSet<String>) {
+    std::thread::spawn(move || {
+        let json = serialize_expanded_folders(&expanded);
+        let db_lock = lock_mutex(&db);
+        let _ = db_lock.set_setting("expanded_folders", &json);
+    });
+}
+
+/// Restore the persisted expanded-folder set: tolerate a missing/corrupt
+/// value (→ empty set) and drop entries that no longer exist among the
+/// current tracks' ancestor dirs.
+fn restore_expanded_folders(tracks: &[Track], raw: Option<String>) -> HashSet<String> {
+    let parsed: Vec<String> = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    if parsed.is_empty() {
+        return HashSet::new();
+    }
+    let mut valid = HashSet::new();
+    for t in tracks {
+        let mut p = PathBuf::from(&t.path);
+        while let Some(parent) = p.parent() {
+            if parent.as_os_str().is_empty() || parent.parent().is_none() {
+                break;
+            }
+            valid.insert(parent.to_string_lossy().to_string());
+            p = parent.to_path_buf();
+        }
+    }
+    parsed.into_iter().filter(|e| valid.contains(e)).collect()
+}
+
 fn map_track_to_slint(t: &Track) -> TrackData {
     let filename = Path::new(&t.path)
         .file_name()
@@ -431,7 +479,7 @@ pub fn run() -> anyhow::Result<()> {
         playback_lock: Arc::new(Mutex::new(())),
     });
 
-    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog) = {
+    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog, saved_expanded_raw, saved_sidebar_width) = {
         let db_lock = lock_mutex(&db);
         let tracks = db_lock.get_all_tracks().unwrap_or_default();
         let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
@@ -442,13 +490,30 @@ pub fn run() -> anyhow::Result<()> {
             .and_then(|s| s.parse::<i32>().ok()).filter(|i| (0..=2).contains(i)).unwrap_or(0);
         let prog = db_lock.get_setting("midi_program").unwrap_or_default()
             .and_then(|s| s.parse::<i32>().ok()).filter(|i| (0..=128).contains(i)).unwrap_or(0);
-        (tracks, folder, col, asc, mode, prog)
+        let expanded_raw = db_lock.get_setting("expanded_folders").unwrap_or_default();
+        let sidebar_width = db_lock.get_setting("sidebar_width").unwrap_or_default()
+            .and_then(|s| s.parse::<f32>().ok()).filter(|w| (150.0..=500.0).contains(w));
+        (tracks, folder, col, asc, mode, prog, expanded_raw, sidebar_width)
     };
 
+    let restored_expanded = restore_expanded_folders(&initial_tracks, saved_expanded_raw);
+
+    // Fall back to empty selection when the saved folder no longer matches
+    // any track (deleted/renamed library dir), instead of showing an empty
+    // list. Persist the fallback so the stale value is not re-read.
+    let mut selected_folder = saved_folder;
+    if !selected_folder.is_empty()
+        && !initial_tracks.iter().any(|t| Path::new(&t.path).starts_with(&selected_folder))
+    {
+        selected_folder = String::new();
+        let db_lock = lock_mutex(&db);
+        let _ = db_lock.set_setting("selected_folder", &selected_folder);
+    }
+
     let ui_state = Arc::new(Mutex::new(UiState {
-        expanded_folders: HashSet::new(),
+        expanded_folders: restored_expanded,
         search_query: String::new(),
-        selected_folder: saved_folder,
+        selected_folder,
         all_tracks: Arc::new(initial_tracks),
         sort_column: saved_col,
         sort_asc: saved_asc,
@@ -492,6 +557,9 @@ pub fn run() -> anyhow::Result<()> {
         ui.set_current_sort_asc(ui_state_guard.sort_asc);
         ui.set_midi_mode_index(ui_state_guard.midi_mode);
         ui.set_midi_program_index(ui_state_guard.midi_program);
+        if let Some(w) = saved_sidebar_width {
+            ui.set_sidebar_width(w);
+        }
         let prog_model: Vec<SharedString> = midi_util::program_model_entries()
             .into_iter()
             .map(SharedString::from)
@@ -597,6 +665,8 @@ pub fn run() -> anyhow::Result<()> {
                 {
                     let db_lock = lock_mutex(&db);
                     let _ = db_lock.set_setting("selected_folder", &path_for_db);
+                    let expanded_json = serialize_expanded_folders(&lock_mutex(&ui_state).expanded_folders);
+                    let _ = db_lock.set_setting("expanded_folders", &expanded_json);
                 }
             } else {
                 let ui_weak = ui_weak.clone();
@@ -721,6 +791,7 @@ pub fn run() -> anyhow::Result<()> {
     let ui_handle_toggle = ui_weak.clone();
     let ui_state_toggle = ui_state.clone();
     let toggle_folder_gen = folder_search_generation.clone();
+    let state_toggle = state.clone();
     ui.on_toggle_folder(move |path| {
         let path_str = path.to_string();
         let mut st = lock_mutex(&ui_state_toggle);
@@ -730,6 +801,7 @@ pub fn run() -> anyhow::Result<()> {
             st.expanded_folders.insert(path_str);
         }
 
+        persist_expanded_folders(state_toggle.db.clone(), st.expanded_folders.clone());
         update_folders_ui(&ui_handle_toggle, &st, &toggle_folder_gen);
     });
 
@@ -771,6 +843,7 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     st.expanded_folders.insert(parent_str.clone());
                     
+                    persist_expanded_folders(state_play.db.clone(), st.expanded_folders.clone());
                     let cur_folder = st.selected_folder.clone();
                     update_folders_ui(&ui_handle, &st, &play_folder_gen);
                     
@@ -1163,6 +1236,16 @@ pub fn run() -> anyhow::Result<()> {
         std::thread::spawn(move || {
             let db_lock = lock_mutex(&db);
             let _ = db_lock.set_setting("midi_program", &idx.to_string());
+        });
+    });
+
+    let state_sidebar = state.clone();
+    ui.on_sidebar_width_changed(move |width| {
+        let db = state_sidebar.db.clone();
+        let px = width.to_string();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("sidebar_width", &px);
         });
     });
 
