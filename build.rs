@@ -11,14 +11,12 @@ fn main() {
         }
         res.compile().unwrap();
 
-        let object = match std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default().as_str() {
-            "msvc" => "resource.lib",
-            _ => "resource.o",
-        };
-        let out_dir = std::env::var("OUT_DIR").unwrap();
-        println!(
-            "cargo:rustc-link-arg-bins={}",
-            std::path::Path::new(&out_dir).join(object).display()
-        );
+        if std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+            let out_dir = std::env::var("OUT_DIR").unwrap();
+            println!(
+                "cargo:rustc-link-arg-bins={}",
+                std::path::Path::new(&out_dir).join("resource.o").display()
+            );
+        }
     }
 }
