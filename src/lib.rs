@@ -569,13 +569,16 @@ pub fn run() -> anyhow::Result<()> {
     timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(100), move || {
         if let Some(ui) = ui_handle_timer.upgrade() {
             if ui.get_is_playing() {
-                let playback = lock_mutex(&state_timer.current_playback);
-                if let Some((duration, start_time)) = *playback {
+                let duration = {
+                    let playback = lock_mutex(&state_timer.current_playback);
+                    playback.map(|(d, _)| d)
+                };
+                if let Some(duration) = duration {
                     if !duration.is_finite() || duration <= 0.0 {
                         ui.set_play_progress(0.0);
                     } else {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let progress = (elapsed / duration).min(1.0) as f32;
+                        let pos = state_timer.sink.get_pos().as_secs_f64();
+                        let progress = (pos / duration).min(1.0) as f32;
                         ui.set_play_progress(progress);
                         if progress >= 1.0 || state_timer.sink.empty() {
                             ui.set_is_playing(false);
@@ -1069,11 +1072,13 @@ pub fn run() -> anyhow::Result<()> {
 
             {
                 let mut cp = lock_mutex(&state.current_playback);
-                // Guard Duration::from_secs_f64 (panics on negative/NaN).
-                let offset = duration * initial_progress;
-                let offset = if offset.is_finite() && offset > 0.0 { offset } else { 0.0 };
-                let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(offset);
-                *cp = Some((duration, start_time));
+                if is_latest() {
+                    // Guard Duration::from_secs_f64 (panics on negative/NaN).
+                    let offset = duration * initial_progress;
+                    let offset = if offset.is_finite() && offset > 0.0 { offset } else { 0.0 };
+                    let start_time = std::time::Instant::now() - std::time::Duration::from_secs_f64(offset);
+                    *cp = Some((duration, start_time));
+                }
             }
 
             {
@@ -1149,6 +1154,12 @@ pub fn run() -> anyhow::Result<()> {
     let ui_stop_weak = ui_weak.clone();
     let state_stop = state.clone();
     ui.on_stop_track(move || {
+        // Bump generation so any in-flight worker (stopped before acquiring
+        // playback_lock) fails its is_latest() recheck and cannot append/play
+        // after stop.
+        state_stop
+            .playback_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(ui) = ui_stop_weak.upgrade() {
             ui.set_is_playing(false);
         }
