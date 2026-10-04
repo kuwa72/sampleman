@@ -24,6 +24,10 @@ pub struct ScanReport {
     pub saved: usize,
     pub walk_errors: usize,
     pub failed_batches: usize,
+    /// Files that failed analysis (decode/parse errors, eprintln only).
+    pub analyze_errors: usize,
+    /// True when the run stopped early via the cancel flag.
+    pub cancelled: bool,
 }
 
 /// Stored waveform format version. Bump to force a one-time full rescan
@@ -45,10 +49,16 @@ impl<'a> Scanner<'a> {
         Self { db }
     }
 
-    pub fn scan_directory<P: AsRef<Path>>(&self, dir: P, progress_tx: crossbeam_channel::Sender<ScanProgress>) -> anyhow::Result<ScanReport> 
+    pub fn scan_directory<P: AsRef<Path>>(
+        &self,
+        dir: P,
+        progress_tx: crossbeam_channel::Sender<ScanProgress>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<ScanReport>
     {
         use rayon::prelude::*;
         use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
 
         progress_tx.send(ScanProgress {
             total: 0,
@@ -73,40 +83,66 @@ impl<'a> Scanner<'a> {
         };
 
         let mut walk_errors: usize = 0;
-        let entries: Vec<_> = WalkDir::new(dir)
-            .into_iter()
-            .filter_map(|e| match e {
-                Ok(entry) => Some(entry),
+        // Cancellable collect loop (checked per entry): a plain iterator
+        // chain cannot stop early on cancel, so walk manually. Emits
+        // periodic "Indexing..." progress so the indeterminate phase (total
+        // unknown) still shows signs of life in the UI.
+        let mut entries: Vec<(std::path::PathBuf, String, i64, i64)> = Vec::new();
+        let mut index_emit = std::time::Instant::now();
+        for e in WalkDir::new(dir).into_iter() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let entry = match e {
+                Ok(entry) => entry,
                 Err(err) => {
                     walk_errors += 1;
                     eprintln!("Scan walk error: {}", err);
-                    None
+                    continue;
                 }
-            })
-            .filter(|e| e.file_type().is_file() && self.is_audio_file(e.path()))
-            .filter_map(|e| {
-                let path = e.path();
-                let path_str = path.to_string_lossy().to_string();
-                
-                if let Ok(metadata) = fs::metadata(path) {
-                    let mtime = metadata.modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
-                    let size = metadata.len() as i64;
-                    
-                    if let Some(mtime) = mtime {
-                        if let Some(&(db_mtime, db_size)) = existing_meta.get(&path_str) {
-                            if !waveform_stale && db_mtime == mtime && db_size == size {
-                                return None;
-                            }
+            };
+            if !(entry.file_type().is_file() && self.is_audio_file(entry.path())) {
+                continue;
+            }
+            let path = entry.path();
+            let path_str = path.to_string_lossy().to_string();
+
+            if let Ok(metadata) = fs::metadata(path) {
+                let mtime = metadata.modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                let size = metadata.len() as i64;
+
+                if let Some(mtime) = mtime {
+                    if let Some(&(db_mtime, db_size)) = existing_meta.get(&path_str) {
+                        if !waveform_stale && db_mtime == mtime && db_size == size {
+                            continue;
                         }
-                        return Some((path.to_path_buf(), path_str, mtime, size));
                     }
+                    entries.push((path.to_path_buf(), path_str, mtime, size));
                 }
-                None
-            })
-            .collect();
+            }
+            if index_emit.elapsed() >= std::time::Duration::from_millis(500) {
+                progress_tx.send(ScanProgress {
+                    total: 0,
+                    current: 0,
+                    path: format!("Indexing directory files... ({} found)", entries.len()),
+                    stage: "Scanning".into(),
+                }).ok();
+                index_emit = std::time::Instant::now();
+            }
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(ScanReport {
+                saved: 0,
+                walk_errors,
+                failed_batches: 0,
+                analyze_errors: 0,
+                cancelled: true,
+            });
+        }
 
         let total = entries.len();
         println!("Found {} potential audio files to analyze.", total);
@@ -125,7 +161,13 @@ impl<'a> Scanner<'a> {
             if walk_errors > 0 {
                 return Err(anyhow::anyhow!("{walk_errors} unreadable entries skipped, no files scanned"));
             }
-            return Ok(ScanReport { saved: 0, walk_errors: 0, failed_batches: 0 });
+            return Ok(ScanReport {
+                saved: 0,
+                walk_errors: 0,
+                failed_batches: 0,
+                analyze_errors: 0,
+                cancelled: false,
+            });
         }
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -133,10 +175,23 @@ impl<'a> Scanner<'a> {
         let mut saved: usize = 0;
         let mut failed_batches: usize = 0;
 
+        // Hoisted out of the scope closure so the report below can carry them.
+        let mut saved: usize = 0;
+        let mut failed_batches: usize = 0;
+        let mut analyze_errors: usize = 0;
+        let mut cancelled = false;
         rayon::scope(|s| {
             // Spawn parallel analysis in the background of the scope
             s.spawn(|_| {
                 entries.into_par_iter().for_each_with(tx, |tx, (path, path_str, mtime, size)| {
+                    // Skip queued work once cancelled; the None still
+                    // advances the collector's `current` counter. The
+                    // collector attributes Nones to cancel (not to
+                    // analyze_errors) while the flag is set.
+                    if cancel.load(Ordering::Relaxed) {
+                        tx.send(None).ok();
+                        return;
+                    }
                     println!("Analyzing: {}", path_str);
                     match scanner_ref.analyze_file(&path, &path_str, mtime, size) {
                         Ok(data) => {
@@ -153,12 +208,24 @@ impl<'a> Scanner<'a> {
             // Collect results in the "main" thread of the scope
             let mut current = 0;
             let mut batch = Vec::new();
+            let mut last_path = String::from("Analyzing...");
             let mut last_emit = std::time::Instant::now();
             
             while let Ok(result) = rx.recv() {
                 current += 1;
+                if cancel.load(Ordering::Relaxed) {
+                    // Stop promptly: in-flight workers finish fast (they
+                    // skip analysis above), then the scope joins them.
+                    // Fall through to save the pending partial batch below.
+                    if let Some(data) = result {
+                        batch.push(data);
+                    }
+                    cancelled = true;
+                    break;
+                }
                 if let Some(data) = result {
                     let path_clone = data.path.clone();
+                    last_path = path_clone.clone();
                     batch.push(data);
                     
                     if batch.len() >= 50 {
@@ -191,11 +258,13 @@ impl<'a> Scanner<'a> {
                         last_emit = std::time::Instant::now();
                     }
                 } else {
+                    // Failure count only (no per-file UI); details go to stderr above.
+                    analyze_errors += 1;
                     if last_emit.elapsed() >= std::time::Duration::from_millis(100) || current == total {
                         progress_tx.send(ScanProgress {
                             total,
                             current,
-                            path: "Error".into(),
+                            path: last_path.clone(),
                             stage: "Analyzing".into(),
                         }).ok();
                         last_emit = std::time::Instant::now();
@@ -229,9 +298,13 @@ impl<'a> Scanner<'a> {
         });
 
         // Waveforms are now current; the next scan resumes incremental behavior.
-        if let Ok(db) = self.db.lock() {
-            if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
-                eprintln!("Failed to persist waveform_version: {}", e);
+        // Skipped on cancel: un-analyzed files keep old-format waveforms, so
+        // the version must stay stale to force a full rescan next time.
+        if !cancelled {
+            if let Ok(db) = self.db.lock() {
+                if let Err(e) = db.set_setting("waveform_version", WAVEFORM_VERSION) {
+                    eprintln!("Failed to persist waveform_version: {}", e);
+                }
             }
         }
 
@@ -244,7 +317,13 @@ impl<'a> Scanner<'a> {
             return Err(anyhow::anyhow!("{failed_batches} batch(es) failed to save{walk_note}"));
         }
 
-        Ok(ScanReport { saved, walk_errors, failed_batches: 0 })
+        Ok(ScanReport {
+            saved,
+            walk_errors,
+            failed_batches: 0,
+            analyze_errors,
+            cancelled,
+        })
     }
 
     fn is_audio_file(&self, path: &Path) -> bool {

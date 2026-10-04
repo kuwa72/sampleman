@@ -31,6 +31,7 @@ export component AppWindow inherits Window {
     background: #1e1e1e;
 
     callback scan-library(string);
+    callback cancel-scan();
     callback play-track(string, float);
     callback stop-track();
     callback select-folder(string);
@@ -49,6 +50,7 @@ export component AppWindow inherits Window {
     in-out property <[TrackData]> tracks: [];
     in-out property <[FolderItem]> folders: [];
     in-out property <string> status-text: "Ready";
+    in-out property <string> scan-stage: "";
     in-out property <float> scan-progress: 0.0;
     in-out property <bool> is-scanning: false;
     
@@ -117,6 +119,7 @@ export component AppWindow inherits Window {
 
             Button {
                 text: "Add Library";
+                enabled: !is-scanning;
                 clicked => { root.scan-library(""); }
             }
 
@@ -484,7 +487,17 @@ export component AppWindow inherits Window {
                             progress: scan-progress;
                             width: 200px;
                         }
-                        Text { text: "Status: " + status-text; font-size: 11px; color: #aaa; vertical-alignment: center; }
+                        Button {
+                            text: "Cancel";
+                            clicked => { root.cancel-scan(); }
+                        }
+                    }
+                    Text {
+                        text: scan-stage == "" ? "Status: " + status-text : "Status: " + scan-stage + " " + status-text;
+                        font-size: 11px;
+                        color: #aaa;
+                        vertical-alignment: center;
+                        overflow: elide;
                     }
                 }
             }

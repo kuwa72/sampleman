@@ -30,6 +30,10 @@ pub struct AppState {
     /// queued event arriving after the completion update cannot flip
     /// is_scanning back on.
     scan_generation: Arc<std::sync::atomic::AtomicUsize>,
+    /// Cancel flag for the running scan, checked periodically by
+    /// `scan_directory` (collect + analyze loops). Set by on_cancel_scan,
+    /// cleared on every scan start.
+    scan_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes all sink operations (stop/append/play) across play-worker
     /// threads and on_stop_track, closing the stop→recheck window where a
     /// stale thread could kill a newer generation's audio.
@@ -77,8 +81,17 @@ fn serialize_expanded_folders(expanded: &HashSet<String>) -> String {
 
 /// Persist the expanded-folder set off the UI thread (spawn + lock +
 /// set_setting, same pattern as the other settings writes).
+/// Debounced 500ms trailing-edge: rapid toggles stamp a newer generation
+/// and only the latest snapshot is written, so a toggle burst costs one DB
+/// write instead of one sleeping thread per toggle doing I/O.
 fn persist_expanded_folders(db: Arc<Mutex<Database>>, expanded: HashSet<String>) {
+    static PERSIST_GEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let gen = PERSIST_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if PERSIST_GEN.load(std::sync::atomic::Ordering::Relaxed) != gen {
+            return;
+        }
         let json = serialize_expanded_folders(&expanded);
         let db_lock = lock_mutex(&db);
         let _ = db_lock.set_setting("expanded_folders", &json);
@@ -403,6 +416,13 @@ fn update_tracks_ui(
     let ui_handle = ui_weak.clone();
 
     std::thread::spawn(move || {
+        // Debounce 180ms: only the latest keystroke's snapshot proceeds.
+        // Cost per keystroke is one short-lived sleeping thread (cheap);
+        // filtering itself stays single-flight via the generation check.
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        if s_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+            return;
+        }
         let indices = get_filtered_track_indices(&all_tracks, &folder, &query, &col, asc);
         
         if s_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
@@ -437,6 +457,11 @@ fn update_folders_ui(
     let ui_handle = ui_weak.clone();
 
     std::thread::spawn(move || {
+        // Same 180ms debounce as update_tracks_ui (see above).
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        if f_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
+            return;
+        }
         let folders = extract_folders_hierarchical(&all_tracks, &expanded, &query);
         
         if f_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
@@ -475,6 +500,7 @@ pub fn run() -> anyhow::Result<()> {
         seek_tx: Arc::new(Mutex::new(None)),
         playback_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         is_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        scan_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         scan_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         playback_lock: Arc::new(Mutex::new(())),
     });
@@ -621,6 +647,10 @@ pub fn run() -> anyhow::Result<()> {
             // Stamp this scan; relay events carry this generation and the UI
             // closure skips stale ones, so a queued event arriving after the
             // completion update cannot flip is_scanning back on.
+            // Also clear any stale cancel request from a previous run.
+            state
+                .scan_cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             let scan_gen = state
                 .scan_generation
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -656,6 +686,7 @@ pub fn run() -> anyhow::Result<()> {
                         ui.set_selected_folder(SharedString::from(&path_for_ui));
                         ui.set_is_scanning(true);
                         ui.set_scan_progress(0.0);
+                        ui.set_scan_stage("Scanning".into());
                         ui.set_status_text("Indexing directory files...".into());
                     }
                 })
@@ -674,6 +705,7 @@ pub fn run() -> anyhow::Result<()> {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_is_scanning(true);
                         ui.set_scan_progress(0.0);
+                        ui.set_scan_stage("Scanning".into());
                         ui.set_status_text("Indexing directory files...".into());
                     }
                 })
@@ -696,10 +728,13 @@ pub fn run() -> anyhow::Result<()> {
                         }
                         if let Some(ui) = ui_weak.upgrade() {
                             ui.set_is_scanning(true);
+                            ui.set_scan_stage(SharedString::from(p.stage.clone()));
                             if p.total > 0 {
                                 ui.set_scan_progress(p.current as f32 / p.total as f32);
                                 ui.set_status_text(format!("{} ({}/{})", p.path, p.current, p.total).into());
                             } else {
+                                // Indeterminate phase (indexing): keep the bar
+                                // at 0 and carry the hint in stage + status text.
                                 ui.set_scan_progress(0.0);
                                 ui.set_status_text(SharedString::from(p.path));
                             }
@@ -709,7 +744,7 @@ pub fn run() -> anyhow::Result<()> {
             });
 
             println!("Calling scan_directory...");
-            let scan_result = scanner.scan_directory(&path, progress_tx);
+            let scan_result = scanner.scan_directory(&path, progress_tx, &state.scan_cancel);
             if let Err(ref e) = scan_result {
                 eprintln!("Scan error: {}", e);
             }
@@ -734,15 +769,18 @@ pub fn run() -> anyhow::Result<()> {
             update_tracks_ui(&ui_weak, &st, &s_gen);
 
             let status = match scan_result {
+                Ok(report) if report.cancelled => {
+                    SharedString::from("Scan cancelled")
+                }
                 Ok(report) => {
+                    let mut msg = format!("Scan Complete: {} added/updated", report.saved);
                     if report.walk_errors > 0 {
-                        SharedString::from(format!(
-                            "Scan Complete: {} added/updated ({} unreadable entries skipped)",
-                            report.saved, report.walk_errors
-                        ))
-                    } else {
-                        SharedString::from(format!("Scan Complete: {} added/updated", report.saved))
+                        msg += &format!(" ({} unreadable entries skipped)", report.walk_errors);
                     }
+                    if report.analyze_errors > 0 {
+                        msg += &format!(" ({} failed)", report.analyze_errors);
+                    }
+                    SharedString::from(msg)
                 }
                 Err(e) => SharedString::from(format!("Scan failed: {}", e)),
             };
@@ -754,6 +792,7 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 if let Some(ui) = ui_weak_complete.upgrade() {
                     ui.set_is_scanning(false);
+                    ui.set_scan_stage("".into());
                     ui.set_status_text(status);
                 }
                 // Invalidate any relay events still queued behind this update.
@@ -763,6 +802,16 @@ pub fn run() -> anyhow::Result<()> {
                 .is_scanning
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         });
+    });
+
+    // Cancel button (visible while is-scanning): the scan loops poll this
+    // flag and stop promptly; the scan thread then reloads partial results
+    // from the DB and reports "Scan cancelled".
+    let state_cancel = state.clone();
+    ui.on_cancel_scan(move || {
+        state_cancel
+            .scan_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     });
 
     let state_filter = state.clone();
@@ -824,6 +873,18 @@ pub fn run() -> anyhow::Result<()> {
         let ui_handle = ui_handle_play.clone();
         let path_str = path.to_string();
         let initial_progress = initial_progress as f64;
+
+        // Short-op busy display: decoding happens on the worker thread
+        // below, so announce it now (overwritten on success/failure).
+        {
+            let filename = Path::new(&path_str)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_str.clone());
+            if let Some(ui) = ui_handle.upgrade() {
+                ui.set_status_text(SharedString::from(format!("Loading {}...", filename)));
+            }
+        }
 
         {
             let mut st = lock_mutex(&ui_state_play);
@@ -1031,6 +1092,9 @@ pub fn run() -> anyhow::Result<()> {
                     return;
                 }
                 if let Some(ui) = ui_handle.upgrade() {
+                    // Overwrite the "Loading ..." status set at play entry.
+                    let status_note =
+                        roll_note.unwrap_or_else(|| format!("Playing {}...", filename));
                     ui.set_current_track_name(SharedString::from(filename));
                     ui.set_current_track_info(SharedString::from(path_for_ui));
 
@@ -1041,9 +1105,7 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     ui.set_waveform_image(Image::from_rgba8(pixel_buffer));
 
-                    if let Some(note) = roll_note {
-                        ui.set_status_text(SharedString::from(note));
-                    }
+                    ui.set_status_text(SharedString::from(status_note));
 
                     ui.set_is_playing(true);
                     ui.set_play_progress(initial_progress as f32);
@@ -1125,28 +1187,38 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
+    let ui_handle_fm = ui_weak.clone();
     ui.on_open_in_file_manager(move |path| {
         let path_str = path.to_string();
         let p = std::path::PathBuf::from(&path_str);
-        
+
         #[cfg(target_os = "windows")]
-        {
-            if p.is_file() {
-                let _ = std::process::Command::new("explorer")
-                    .arg("/select,")
-                    .arg(&p)
-                    .spawn();
-            } else {
-                let _ = std::process::Command::new("explorer")
-                    .arg(&p)
-                    .spawn();
-            }
-        }
+        let res = if p.is_file() {
+            std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(&p)
+                .spawn()
+                .map(|_| ())
+        } else {
+            std::process::Command::new("explorer")
+                .arg(&p)
+                .spawn()
+                .map(|_| ())
+        };
         #[cfg(not(target_os = "windows"))]
-        {
+        let res = {
             let target = if p.is_file() { p.parent().unwrap_or(&p) } else { &p };
             let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-            let _ = std::process::Command::new(cmd).arg(target).spawn();
+            std::process::Command::new(cmd).arg(target).spawn().map(|_| ())
+        };
+        if let Err(e) = res {
+            eprintln!("Failed to open file manager for {}: {}", path_str, e);
+            if let Some(ui) = ui_handle_fm.upgrade() {
+                ui.set_status_text(SharedString::from(format!(
+                    "Could not open file manager: {}",
+                    e
+                )));
+            }
         }
     });
 
