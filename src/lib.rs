@@ -24,6 +24,14 @@ pub struct AppState {
     seek_tx: Arc<Mutex<Option<crossbeam_channel::Sender<f64>>>>,
     playback_generation: Arc<std::sync::atomic::AtomicUsize>,
     is_scanning: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes all sink operations (stop/append/play) across play-worker
+    /// threads and on_stop_track, closing the stop→recheck window where a
+    /// stale thread could kill a newer generation's audio.
+    /// Lock ordering: this is a LEAF lock. Hold it ONLY around sink ops,
+    /// never while acquiring current_playback / seek_tx / db / ui_state,
+    /// and never across slint::invoke_from_event_loop. Release before any
+    /// UI update or state-lock acquisition.
+    playback_lock: Arc<Mutex<()>>,
 }
 
 struct UiState {
@@ -413,6 +421,7 @@ pub fn run() -> anyhow::Result<()> {
         seek_tx: Arc::new(Mutex::new(None)),
         playback_generation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         is_scanning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        playback_lock: Arc::new(Mutex::new(())),
     });
 
     let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog) = {
@@ -839,14 +848,23 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
 
-            state.sink.stop();
-            // Recheck after the (possibly slow) sink stop: another play may
-            // have started while we were blocked.
-            if !is_latest() {
-                return;
+            // Serialize sink ops under playback_lock for the whole
+            // stop→recheck→append→play sequence, so a stale thread can never
+            // kill a newer generation's audio in the stop→recheck window.
+            // Leaf lock: held ONLY here, released before state locks / UI
+            // updates (see AppState docs). Generation rechecks stay as
+            // belt-and-suspenders alongside the lock.
+            {
+                let _playback_guard = lock_mutex(&state.playback_lock);
+                state.sink.stop();
+                // Recheck after the (possibly slow) sink stop: another play may
+                // have started while we were blocked.
+                if !is_latest() {
+                    return;
+                }
+                state.sink.append(source);
+                state.sink.play();
             }
-            state.sink.append(source);
-            state.sink.play();
 
             {
                 let mut cp = lock_mutex(&state.current_playback);
@@ -932,7 +950,24 @@ pub fn run() -> anyhow::Result<()> {
         if let Some(ui) = ui_stop_weak.upgrade() {
             ui.set_is_playing(false);
         }
-        state_stop.sink.stop();
+        // Serialize with play workers (leaf lock: sink ops only, released
+        // before touching state locks — see AppState docs).
+        {
+            let _playback_guard = lock_mutex(&state_stop.playback_lock);
+            state_stop.sink.stop();
+        }
+        // Clear playback state so a later seek press no-ops (the seek handler
+        // only acts on Some(tx)) instead of resurrecting a dead timestamp.
+        // Sequential scopes: never hold current_playback while acquiring
+        // seek_tx or vice versa.
+        {
+            let mut cp = lock_mutex(&state_stop.current_playback);
+            *cp = None;
+        }
+        {
+            let mut tx_guard = lock_mutex(&state_stop.seek_tx);
+            *tx_guard = None;
+        }
     });
 
     let ui_handle_drag = ui_weak.clone();

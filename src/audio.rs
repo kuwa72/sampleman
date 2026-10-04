@@ -216,11 +216,25 @@ impl Iterator for MidiSource {
             // Re-play from start
             self.sequencer.play(&self.midi, false);
             
-            // Fast-forward to target time
+            // Fast-forward to target time, with an iteration cap so a corrupt
+            // or looping MIDI file can never spin the audio thread: each skip
+            // block renders 1024 frames (~23ms at 44.1kHz), so 8192 blocks
+            // cover ~190s of audio. (Playback buffers are 512 samples; the
+            // 1024-sample skip buffers are kept as-is.)
             let mut skip_left = vec![0.0; 1024];
             let mut skip_right = vec![0.0; 1024];
+            const MAX_SKIP_BLOCKS: u32 = 8192;
+            let mut skip_blocks: u32 = 0;
             while self.sequencer.get_position() < secs && !self.sequencer.end_of_sequence() {
                 self.sequencer.render(&mut skip_left, &mut skip_right);
+                skip_blocks += 1;
+                if skip_blocks >= MAX_SKIP_BLOCKS {
+                    eprintln!(
+                        "MIDI seek fast-forward capped at {} blocks (target {}s)",
+                        MAX_SKIP_BLOCKS, secs
+                    );
+                    break;
+                }
             }
             self.buf_index = self.left_buf.len(); // Force refills
         }
