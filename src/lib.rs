@@ -2,6 +2,7 @@ pub mod database;
 mod scanner;
 pub mod audio;
 mod midi_util;
+pub mod music_meta;
 
 use crate::database::{Database, Track};
 use crate::scanner::{Scanner, ScanProgress};
@@ -49,6 +50,7 @@ struct UiState {
     search_query: String,
     selected_folder: String,
     all_tracks: Arc<Vec<Track>>, // Cached tracks in memory
+    favorites: Arc<HashSet<String>>, // Cached favorite paths (refreshed on toggle)
     sort_column: String,
     sort_asc: bool,
     folder_search_query: String, // Added
@@ -123,7 +125,7 @@ fn restore_expanded_folders(tracks: &[Track], raw: Option<String>) -> HashSet<St
     parsed.into_iter().filter(|e| valid.contains(e)).collect()
 }
 
-fn map_track_to_slint(t: &Track) -> TrackData {
+fn map_track_to_slint(t: &Track, favorites: &HashSet<String>) -> TrackData {
     let filename = Path::new(&t.path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -147,6 +149,9 @@ fn map_track_to_slint(t: &Track) -> TrackData {
         bit_depth: SharedString::from(t.bit_depth.map(|s| format!("{}bit", s)).unwrap_or_else(|| "-".into())),
         channels: SharedString::from(t.channels.map(|s| format!("{}ch", s)).unwrap_or_else(|| "-".into())),
         mtime: SharedString::from(mtime_str),
+        bpm: SharedString::from(t.bpm.map(|b| format!("{:.0}", b)).unwrap_or_else(|| "-".into())),
+        musical_key: SharedString::from(t.musical_key.clone().unwrap_or_else(|| "-".into())),
+        is_favorite: favorites.contains(&t.path),
     }
 }
 
@@ -283,6 +288,8 @@ fn get_filtered_track_indices(tracks: &[Track], folder: &str, query: &str, sort_
             "sample_rate" => at.sample_rate.unwrap_or(0).cmp(&bt.sample_rate.unwrap_or(0)),
             "channels" => at.channels.unwrap_or(0).cmp(&bt.channels.unwrap_or(0)),
             "mtime" => at.mtime.cmp(&bt.mtime),
+            "bpm" => at.bpm.unwrap_or(-1.0).partial_cmp(&bt.bpm.unwrap_or(-1.0)).unwrap_or(std::cmp::Ordering::Equal),
+            "key" => at.musical_key.cmp(&bt.musical_key),
             _ => std::cmp::Ordering::Equal,
         };
         if sort_asc { res } else { res.reverse() }
@@ -381,6 +388,7 @@ fn create_piano_roll_pixels(notes: &[midi_util::NoteEv]) -> (u32, u32, Vec<u8>) 
 struct TrackListModel {
     tracks: Arc<Vec<Track>>,
     indices: Vec<usize>,
+    favorites: Arc<HashSet<String>>,
     notify: slint::ModelNotify,
 }
 
@@ -392,7 +400,7 @@ impl slint::Model for TrackListModel {
     }
 
     fn row_data(&self, row: usize) -> Option<Self::Data> {
-        self.indices.get(row).and_then(|&idx| self.tracks.get(idx).map(map_track_to_slint))
+        self.indices.get(row).and_then(|&idx| self.tracks.get(idx).map(|t| map_track_to_slint(t, &self.favorites)))
     }
 
     fn model_tracker(&self) -> &dyn slint::ModelTracker {
@@ -410,6 +418,7 @@ fn update_tracks_ui(
     let col = st.sort_column.clone();
     let asc = st.sort_asc;
     let all_tracks = st.all_tracks.clone();
+    let favorites = st.favorites.clone();
 
     let gen = search_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let s_gen = search_generation.clone();
@@ -433,6 +442,7 @@ fn update_tracks_ui(
             let model = TrackListModel {
                 tracks: all_tracks,
                 indices,
+                favorites,
                 notify: slint::ModelNotify::default(),
             };
             if let Some(ui) = ui_handle.upgrade() {
@@ -505,7 +515,7 @@ pub fn run() -> anyhow::Result<()> {
         playback_lock: Arc::new(Mutex::new(())),
     });
 
-    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog, saved_expanded_raw, saved_sidebar_width) = {
+    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog, saved_expanded_raw, saved_sidebar_width, saved_favs) = {
         let db_lock = lock_mutex(&db);
         let tracks = db_lock.get_all_tracks().unwrap_or_default();
         let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
@@ -519,7 +529,8 @@ pub fn run() -> anyhow::Result<()> {
         let expanded_raw = db_lock.get_setting("expanded_folders").unwrap_or_default();
         let sidebar_width = db_lock.get_setting("sidebar_width").unwrap_or_default()
             .and_then(|s| s.parse::<f32>().ok()).filter(|w| (150.0..=500.0).contains(w));
-        (tracks, folder, col, asc, mode, prog, expanded_raw, sidebar_width)
+        let favs = db_lock.get_favorites().unwrap_or_default();
+        (tracks, folder, col, asc, mode, prog, expanded_raw, sidebar_width, favs)
     };
 
     let restored_expanded = restore_expanded_folders(&initial_tracks, saved_expanded_raw);
@@ -541,6 +552,7 @@ pub fn run() -> anyhow::Result<()> {
         search_query: String::new(),
         selected_folder,
         all_tracks: Arc::new(initial_tracks),
+        favorites: Arc::new(saved_favs),
         sort_column: saved_col,
         sort_asc: saved_asc,
         folder_search_query: String::new(),
@@ -763,6 +775,23 @@ pub fn run() -> anyhow::Result<()> {
             );
 
             let mut st = lock_mutex(&ui_state);
+            // Duplicate groups from content_hash (Tier 2, minimal: count
+            // into the status text + stderr; no dedicated UI).
+            let dup_groups = {
+                let mut counts = std::collections::HashMap::new();
+                for t in &tracks {
+                    if let Some(h) = t.content_hash.as_deref() {
+                        if !h.is_empty() {
+                            *counts.entry(h).or_insert(0usize) += 1;
+                        }
+                    }
+                }
+                let n = counts.values().filter(|&&c| c > 1).count();
+                if n > 0 {
+                    eprintln!("Duplicate detection: {} duplicate groups", n);
+                }
+                n
+            };
             st.all_tracks = Arc::new(tracks); // Update cache!
 
             update_folders_ui(&ui_weak, &st, &f_gen);
@@ -774,6 +803,9 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 Ok(report) => {
                     let mut msg = format!("Scan Complete: {} added/updated", report.saved);
+                    if dup_groups > 0 {
+                        msg += &format!(" ({} duplicate groups)", dup_groups);
+                    }
                     if report.walk_errors > 0 {
                         msg += &format!(" ({} unreadable entries skipped)", report.walk_errors);
                     }
@@ -1253,6 +1285,30 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         update_tracks_ui(&ui_handle_sort, &st, &sort_track_gen);
+    });
+
+    let state_fav = state.clone();
+    let ui_handle_fav = ui_weak.clone();
+    let ui_state_fav = ui_state.clone();
+    let fav_track_gen = search_generation.clone();
+    ui.on_toggle_favorite(move |path| {
+        let path_str = path.to_string();
+        let new_state = {
+            let db = lock_mutex(&state_fav.db);
+            db.toggle_favorite(&path_str).unwrap_or(false)
+        };
+        {
+            let mut st = lock_mutex(&ui_state_fav);
+            // Refresh the cached set from the toggled path (no full reload).
+            let mut favs = (*st.favorites).clone();
+            if new_state {
+                favs.insert(path_str);
+            } else {
+                favs.remove(&path_str);
+            }
+            st.favorites = Arc::new(favs);
+            update_tracks_ui(&ui_handle_fav, &st, &fav_track_gen);
+        }
     });
 
     let ui_state_folder_search = ui_state.clone();

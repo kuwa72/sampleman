@@ -33,7 +33,9 @@ pub struct ScanReport {
 /// Stored waveform format version. Bump to force a one-time full rescan
 /// that regenerates waveforms saved in an older format.
 /// v3: adds MIDI summary columns (midi_channels/midi_programs/has_drums).
-const WAVEFORM_VERSION: &str = "3";
+/// v4: adds music meta columns (bpm/musical_key/instrument/content_hash).
+/// v5: content_hash switched to deterministic FNV-1a (v4 SipHash values churn).
+const WAVEFORM_VERSION: &str = "5";
 /// Fixed number of peaks stored per track: whole-file coverage resampled
 /// by max-pooling (stereo/mono unified, DB size bounded).
 const WAVEFORM_PEAKS: usize = 1200;
@@ -348,6 +350,15 @@ impl<'a> Scanner<'a> {
             let summary = crate::midi_util::parse_summary(&bytes).ok();
             let midi = rustysynth::MidiFile::new(&mut &bytes[..]).map_err(|e| anyhow::anyhow!("MIDI parse error: {:?}", e))?;
             let duration = midi.get_length();
+            // Filename parse first; fall back to the first GM program name
+            // when the filename carries no instrument hint.
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(path_str);
+            let meta = crate::music_meta::parse_filename_meta(file_name);
+            let instrument = meta.instrument.clone().or_else(|| {
+                summary.as_ref().and_then(|s| s.programs.first()).map(|(_, p)| {
+                    crate::midi_util::GM_PROGRAM_NAMES[*p as usize].to_string()
+                })
+            });
             let (midi_channels, midi_programs, has_drums) = match summary {
                 Some(s) => (
                     Some(s.channels.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",")),
@@ -374,6 +385,10 @@ impl<'a> Scanner<'a> {
                 midi_channels,
                 midi_programs,
                 has_drums,
+                bpm: meta.bpm,
+                musical_key: meta.musical_key,
+                instrument,
+                content_hash: content_hash_for(path, size),
             });
         }
 
@@ -434,6 +449,10 @@ impl<'a> Scanner<'a> {
         let (waveform, measured_duration) = self.extract_waveform(&mut format, track_id)?;
         let duration = header_duration.unwrap_or(measured_duration);
 
+        // Filename conventions only (no audio-content BPM/key detection).
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(path_str);
+        let meta = crate::music_meta::parse_filename_meta(file_name);
+
         Ok(TrackData {
             path: path_str.to_string(),
             mtime,
@@ -451,6 +470,10 @@ impl<'a> Scanner<'a> {
             midi_channels: None,
             midi_programs: None,
             has_drums: None,
+            bpm: meta.bpm,
+            musical_key: meta.musical_key,
+            instrument: meta.instrument,
+            content_hash: content_hash_for(path, size),
         })
     }
 
@@ -529,6 +552,38 @@ impl<'a> Scanner<'a> {
 
         Ok((resample_peaks(&fine, WAVEFORM_PEAKS), measured_duration))
     }
+}
+
+/// Cheap duplicate-detection hash: file size + first/last 64KB windows.
+/// Full-file hashing is too heavy for large samples at scan time.
+/// `None` on any I/O error (never fails the scan).
+fn content_hash_for(path: &Path, size: i64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+    // FNV-1a 64: deterministic across runs/platforms (unlike DefaultHasher,
+    // whose SipHash keys are random per process, breaking cross-scan compare).
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    mix(&size.to_le_bytes());
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; WINDOW as usize];
+    let n = f.read(&mut buf).ok()?;
+    mix(&buf[..n]);
+    let len = size.max(0) as u64;
+    if len > WINDOW {
+        f.seek(SeekFrom::Start(len - WINDOW)).ok()?;
+        let mut tail = Vec::new();
+        f.take(WINDOW).read_to_end(&mut tail).ok()?;
+        mix(&tail);
+    }
+    Some(format!("{:016x}", h))
 }
 
 /// Resamples fine peaks to exactly `target` entries covering the same
