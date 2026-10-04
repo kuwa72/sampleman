@@ -4,29 +4,31 @@ A cross-platform desktop sample/audio library manager for DTM (Desktop Music) pr
 
 > **TL;DR** — sampleman is a fast, offline-native sample library browser for musicians who work with large collections of WAV/MP3/FLAC/MIDI loops and one-shots. It scans folders, extracts BPM/key/instruments from filenames, detects duplicates via content hashing, and provides a searchable table with waveform previews, MIDI piano-roll support, and playback controls.
 
+> 日本語ドキュメント: [README.ja.md](README.ja.md)
+
 ---
 
-## Features / 機能
+## Features
 
-### Core / コア
+### Core
 - **Fast folder scanning** — recursive scan of WAV, MP3, FLAC, AIFF, M4A, OGG, WMA, AAC, MIDI
 - **Waveform preview** — whole-file waveform rendered as 1200-peak summary
 - **Playback engine** — Symphonia-based audio + `rodio` sink with MIDI synthesis via `rustysynth`
 - **SQLite database** — persistent track metadata, favorites, and sort/filter state
 - **Fuzzy search** — fast fuzzy matching with 180 ms input debounce
 
-### Music metadata (DTM) / 音楽メタデータ (DTM向け)
+### Music metadata (DTM)
 - **Filename parsing** — extract BPM, key, and instrument from common pack naming conventions (e.g. `120BPM Am Piano Loop.wav`)
 - **Favorites** — star-toggle tracks with persistent storage
 - **Duplicate detection** — FNV-1a content-hash identifies identical files across the library
 - **Sort & filter** — by BPM, Key, Artist, Album, or favorites
 
-### MIDI / MIDI
+### MIDI
 - **Piano-roll rendering** — MIDI tracks show a piano-roll waveform in the track list
 - **Drum / Synth channel mode** — select GM sound set per MIDI playback
 - **MIDI seek** — seek within MIDI playback via the progress bar
 
-### UI & UX / UIとユーザー体験
+### UI & UX
 - **Scan progress** — staged progress display (Scanning → Analyzing → Saving), cancel button, completion summary
 - **Error visibility** — walk errors and failed batches counted and surfaced in status
 - **Tree state persistence** — expanded folders and selected folder restored on relaunch
@@ -34,15 +36,15 @@ A cross-platform desktop sample/audio library manager for DTM (Desktop Music) pr
 
 ---
 
-## Screenshots / スクリーンショット
+## Screenshots
 
 > Screenshots will be added after the first release build.
 
 ---
 
-## Building from source / ソースからビルド
+## Building from source
 
-### Prerequisites / 必要条件
+### Prerequisites
 
 | Platform | Requirements |
 |----------|-------------|
@@ -50,7 +52,7 @@ A cross-platform desktop sample/audio library manager for DTM (Desktop Music) pr
 | **macOS** | Xcode Command Line Tools (`xcode-select --install`) |
 | **Windows** | Visual Studio 2022 (C++ build tools) |
 
-### Build / ビルド
+### Build
 
 ```bash
 git clone https://github.com/kuwa72/sampleman.git
@@ -60,7 +62,7 @@ cargo build --release
 
 The binary will be at `target/release/sampleman`.
 
-### Run tests / テスト実行
+### Run tests
 
 ```bash
 bash test/run-tests.sh
@@ -70,7 +72,7 @@ Pure-logic modules (music meta parsing, MIDI utilities) carry `#[cfg(test)]` uni
 
 ---
 
-## Usage / 使用方法
+## Usage
 
 1. **Add a library folder** — click the folder icon or drag a directory onto the window.
 2. **Wait for scan** — sampleman recursively scans for audio files and indexes them.
@@ -78,7 +80,7 @@ Pure-logic modules (music meta parsing, MIDI utilities) carry `#[cfg(test)]` uni
 4. **Preview** — click the play button on any track to audition; drag the progress bar to seek.
 5. **Organize** — toggle favorites (star) and use BPM/Key columns to filter your collection.
 
-### Keyboard shortcuts / キーボードショートカット
+### Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
@@ -89,7 +91,7 @@ Pure-logic modules (music meta parsing, MIDI utilities) carry `#[cfg(test)]` uni
 
 ---
 
-## Project structure / プロジェクト構造
+## Project structure
 
 ```
 sampleman/
@@ -107,17 +109,17 @@ sampleman/
 
 ---
 
-## License / ライセンス
+## License
 
 This project is licensed under the MIT License — see the bundled `LICENSE` file or the repository's license dropdown on GitHub.
 
 ---
 
-## Development / 開発
+## Development
 
 See [`AGENTS.md`](./AGENTS.md) for the issue-driven development workflow.
 
-### Dependencies / 依存関係
+### Dependencies
 
 | Category | Key crates |
 |----------|-----------|
@@ -130,7 +132,7 @@ See [`AGENTS.md`](./AGENTS.md) for the issue-driven development workflow.
 
 ---
 
-## 対応環境 / Supported Platforms
+## Supported Platforms
 
 - **Linux** (x86_64) — tested on Ubuntu 22.04+
 - **macOS** (Apple Silicon + Intel)
@@ -138,7 +140,7 @@ See [`AGENTS.md`](./AGENTS.md) for the issue-driven development workflow.
 
 ---
 
-## Contributing / コントリビューション
+## Contributing
 
 Contributions are welcome! Please open an issue first to discuss proposed changes.
 
@@ -147,7 +149,3 @@ Contributions are welcome! Please open an issue first to discuss proposed change
 3. Write tests for new logic (`test/run-tests.sh`)
 4. Ensure all CI checks pass
 5. Open a PR
-
----
-
-*This README is bilingual (English primary / 日本語二重). The default documentation language is English.*
