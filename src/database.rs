@@ -313,6 +313,39 @@ impl Database {
         Ok(removed)
     }
 
+    /// Delete every track under `prefix` (the folder itself and all
+    /// descendants) plus its favorites entry. Returns tracks removed.
+    /// Used by "Remove from Library" — files on disk are untouched.
+    pub fn remove_under(&self, prefix: &str) -> Result<usize> {
+        let escaped = Self::escape_like(prefix);
+        // LIKE covers '/' separators; '\\%' covers Windows-style stored
+        // paths (escape_like already doubled prefix backslashes).
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM tracks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\' OR path LIKE ?3 ESCAPE '\\'")?;
+        let paths: Vec<String> = stmt
+            .query_map(
+                params![prefix, format!("{}/%", escaped), format!("{}\\\\%", escaped)],
+                |row| row.get(0),
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        let mut removed = 0;
+        for p in paths {
+            // Component-aware match (defense in depth against LIKE edge cases).
+            if p != prefix && !Path::new(&p).starts_with(prefix) {
+                continue;
+            }
+            removed += self
+                .conn
+                .execute("DELETE FROM tracks WHERE path = ?", params![p])?;
+            self.conn
+                .execute("DELETE FROM favorites WHERE path = ?", params![p])?;
+        }
+        Ok(removed)
+    }
+
     /// All favorited paths (rating column reserved; flag = row presence).
     pub fn get_favorites(&self) -> Result<HashSet<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM favorites")?;

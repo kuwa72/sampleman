@@ -3,6 +3,8 @@ mod scanner;
 pub mod audio;
 mod midi_util;
 pub mod music_meta;
+#[cfg(windows)]
+mod win32drag;
 
 use crate::database::{Database, Track};
 use crate::scanner::{Scanner, ScanProgress};
@@ -10,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use rodio::{OutputStream, Sink};
 use slint::{ComponentHandle, SharedString, Image, SharedPixelBuffer, Rgba8Pixel};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use chrono::{TimeZone, Local};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -56,6 +58,13 @@ struct UiState {
     folder_search_query: String, // Added
     midi_mode: i32,    // ChannelMode ComboBox index: 0=Auto, 1=Synth, 2=Drums
     midi_program: i32, // Program ComboBox index: 0=Auto, 1..=128=GM program+1
+    favorites_only: bool,
+    /// Folder sort mode: 0 = name asc, 1 = name desc,
+    /// 2 = track-count desc, 3 = track-count asc.
+    folder_sort: i32,
+    /// Folder to scroll into view after the next folders-model rebuild
+    /// (set by play/reveal, consumed by `update_folders_ui`).
+    reveal_folder: Option<String>,
 }
 
 /// Lock a mutex, recovering from poisoning instead of panicking.
@@ -155,8 +164,12 @@ fn map_track_to_slint(t: &Track, favorites: &HashSet<String>) -> TrackData {
     }
 }
 
-fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, folder_query: &str) -> Vec<FolderItem> {
+/// Collect every ancestor dir of every track, plus the number of tracks
+/// under each (descendants included). One pass used by both the folder
+/// tree build and "expand all".
+fn folder_ancestors(tracks: &[Track]) -> (HashSet<PathBuf>, HashMap<PathBuf, usize>) {
     let mut all_paths = HashSet::new();
+    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
     for t in tracks {
         let mut p = PathBuf::from(&t.path);
         while let Some(parent) = p.parent() {
@@ -164,13 +177,63 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
                 break;
             }
             all_paths.insert(parent.to_path_buf());
+            *counts.entry(parent.to_path_buf()).or_insert(0) += 1;
             p = parent.to_path_buf();
         }
     }
-    
+    (all_paths, counts)
+}
+
+/// Emit `path` and its visible descendants into `items`, depth-first.
+/// When `filtering`, only `visible_paths` appear and expansion state is
+/// ignored (all shown). Otherwise a node's children appear only when it
+/// is in `expanded`.
+fn emit_folder(
+    path: &Path,
+    depth: usize,
+    filtering: bool,
+    visible_paths: &HashSet<PathBuf>,
+    expanded: &HashSet<String>,
+    children: &HashMap<PathBuf, Vec<PathBuf>>,
+    items: &mut Vec<FolderItem>,
+) {
+    if filtering && !visible_paths.contains(path) {
+        return;
+    }
+    let path_str = path.to_string_lossy().to_string();
+    let kids: &[PathBuf] = children.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+    let is_expanded = filtering || expanded.contains(&path_str);
+    items.push(FolderItem {
+        path: path_str.clone().into(),
+        name: path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string())
+            .into(),
+        indent: (depth * 15) as f32,
+        is_expanded,
+        has_children: !kids.is_empty(),
+    });
+    if is_expanded {
+        for c in kids {
+            emit_folder(c, depth + 1, filtering, visible_paths, expanded, children, items);
+        }
+    }
+}
+
+/// Build the sidebar folder rows. `sort_mode`: 0 = name asc, 1 = name
+/// desc, 2 = track-count desc, 3 = track-count asc; sort applies within
+/// each sibling group so parents always stay above their children.
+fn extract_folders_hierarchical(
+    tracks: &[Track],
+    expanded: &HashSet<String>,
+    folder_query: &str,
+    sort_mode: i32,
+) -> Vec<FolderItem> {
+    let (all_paths, counts) = folder_ancestors(tracks);
+
     let matcher = SkimMatcherV2::default().ignore_case();
     let mut visible_paths = HashSet::new();
-
     if !folder_query.is_empty() {
         for p in &all_paths {
             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -184,63 +247,78 @@ fn extract_folders_hierarchical(tracks: &[Track], expanded: &HashSet<String>, fo
             }
         }
     }
+    let filtering = !folder_query.is_empty();
 
-    let mut sorted_paths: Vec<_> = all_paths.iter().collect();
-    sorted_paths.sort_by(|a, b| {
-        let a_str = a.to_string_lossy().to_lowercase();
-        let b_str = b.to_string_lossy().to_lowercase();
-        a_str.cmp(&b_str)
-    });
+    // Group dirs by parent; dirs whose parent is outside the set are roots.
+    let mut children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for p in &all_paths {
+        match p.parent() {
+            Some(par) if all_paths.contains(par) => {
+                children.entry(par.to_path_buf()).or_default().push(p.clone())
+            }
+            _ => roots.push(p.clone()),
+        }
+    }
+
+    let name_of = |p: &PathBuf| {
+        p.file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| p.to_string_lossy().to_lowercase())
+    };
+    let cmp = |a: &PathBuf, b: &PathBuf| match sort_mode {
+        1 => name_of(b).cmp(&name_of(a)),
+        2 => counts
+            .get(b)
+            .cmp(&counts.get(a))
+            .then_with(|| name_of(a).cmp(&name_of(b))),
+        3 => counts
+            .get(a)
+            .cmp(&counts.get(b))
+            .then_with(|| name_of(a).cmp(&name_of(b))),
+        _ => name_of(a).cmp(&name_of(b)),
+    };
+    roots.sort_by(&cmp);
+    for v in children.values_mut() {
+        v.sort_by(&cmp);
+    }
 
     let mut items = Vec::new();
-    for p in sorted_paths {
-        if !folder_query.is_empty() && !visible_paths.contains(p) {
-            continue;
-        }
-
-        let mut parent = p.parent();
-        let mut visible = true;
-        
-        if folder_query.is_empty() {
-            while let Some(par) = parent {
-                if par.as_os_str().is_empty() || par.parent().is_none() {
-                    break;
-                }
-                if !expanded.contains(&par.to_string_lossy().to_string()) {
-                    visible = false;
-                    break;
-                }
-                parent = par.parent();
-            }
-        }
-
-        if !visible {
-            continue;
-        }
-
-        let name = p.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| p.to_string_lossy().to_string());
-        
-        let path_str = p.to_string_lossy().to_string();
-        let indent = (p.components().count().saturating_sub(1) * 15) as f32;
-        let has_children = all_paths.iter().any(|other| other.parent() == Some(&p));
-        
-        items.push(FolderItem {
-            path: path_str.clone().into(),
-            name: name.into(),
-            indent,
-            is_expanded: if !folder_query.is_empty() { true } else { expanded.contains(&path_str) },
-            has_children,
-        });
+    for r in &roots {
+        emit_folder(r, 0, filtering, &visible_paths, expanded, &children, &mut items);
     }
     items
 }
 
-fn get_filtered_track_indices(tracks: &[Track], folder: &str, query: &str, sort_column: &str, sort_asc: bool) -> Vec<usize> {
+/// Expand every ancestor of `parent` plus `parent` itself and request a
+/// scroll so `parent` is visible in the folder tree. Does NOT touch
+/// `selected_folder` — used for reveal-on-play / reveal-in-tree.
+fn reveal_folder_in_tree(st: &mut UiState, parent: &Path) {
+    let mut curr = parent.to_path_buf();
+    while let Some(par) = curr.parent() {
+        if par.as_os_str().is_empty() || par.parent().is_none() {
+            break;
+        }
+        st.expanded_folders.insert(par.to_string_lossy().to_string());
+        curr = par.to_path_buf();
+    }
+    st.expanded_folders.insert(parent.to_string_lossy().to_string());
+    st.reveal_folder = Some(parent.to_string_lossy().to_string());
+}
+
+fn get_filtered_track_indices(
+    tracks: &[Track],
+    folder: &str,
+    query: &str,
+    sort_column: &str,
+    sort_asc: bool,
+    favorites: &HashSet<String>,
+    favorites_only: bool,
+) -> Vec<usize> {
     let mut filtered: Vec<(usize, i64)> = tracks.par_iter()
         .enumerate()
         .filter(|(_, t)| folder.is_empty() || Path::new(&t.path).starts_with(folder))
+        .filter(|(_, t)| !favorites_only || favorites.contains(&t.path))
         .filter_map(|(idx, t)| {
             if query.is_empty() {
                 return Some((idx, 0));
@@ -419,6 +497,7 @@ fn update_tracks_ui(
     let asc = st.sort_asc;
     let all_tracks = st.all_tracks.clone();
     let favorites = st.favorites.clone();
+    let favorites_only = st.favorites_only;
 
     let gen = search_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let s_gen = search_generation.clone();
@@ -432,7 +511,7 @@ fn update_tracks_ui(
         if s_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
             return;
         }
-        let indices = get_filtered_track_indices(&all_tracks, &folder, &query, &col, asc);
+        let indices = get_filtered_track_indices(&all_tracks, &folder, &query, &col, asc, &favorites, favorites_only);
         
         if s_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
             return;
@@ -455,12 +534,15 @@ fn update_tracks_ui(
 
 fn update_folders_ui(
     ui_weak: &slint::Weak<AppWindow>,
-    st: &UiState,
+    st: &mut UiState,
     folder_search_generation: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let expanded = st.expanded_folders.clone();
     let query = st.folder_search_query.clone();
+    let sort_mode = st.folder_sort;
     let all_tracks = st.all_tracks.clone();
+    // Consumed here: the row is scrolled into view once this rebuild lands.
+    let reveal = st.reveal_folder.take();
 
     let gen = folder_search_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let f_gen = folder_search_generation.clone();
@@ -472,8 +554,12 @@ fn update_folders_ui(
         if f_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
             return;
         }
-        let folders = extract_folders_hierarchical(&all_tracks, &expanded, &query);
-        
+        let folders = extract_folders_hierarchical(&all_tracks, &expanded, &query, sort_mode);
+        let reveal_idx = reveal
+            .and_then(|rp| folders.iter().position(|f| f.path.as_str() == rp))
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+
         if f_gen.load(std::sync::atomic::Ordering::Relaxed) != gen {
             return;
         }
@@ -481,6 +567,8 @@ fn update_folders_ui(
         slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_handle.upgrade() {
                 ui.set_folders(slint::ModelRc::new(slint::VecModel::from(folders)));
+                ui.set_folder_reveal_index(reveal_idx);
+                let _ = ui.invoke_reveal_folder_row();
             }
         }).ok();
     });
@@ -508,6 +596,7 @@ pub fn run() -> anyhow::Result<()> {
         use i_slint_backend_winit::WinitWindowAccessor;
         let _ = ui.window().with_winit_window(|winit_window| {
             set_window_icon_from_exe_resource(winit_window);
+            crate::win32drag::install(winit_window);
         });
     }
 
@@ -523,7 +612,7 @@ pub fn run() -> anyhow::Result<()> {
         playback_lock: Arc::new(Mutex::new(())),
     });
 
-    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog, saved_expanded_raw, saved_sidebar_width, saved_favs) = {
+    let (initial_tracks, saved_folder, saved_col, saved_asc, saved_mode, saved_prog, saved_expanded_raw, saved_sidebar_width, saved_favs, saved_fav_only, saved_folder_sort, saved_volume) = {
         let db_lock = lock_mutex(&db);
         let tracks = db_lock.get_all_tracks().unwrap_or_default();
         let folder = db_lock.get_setting("selected_folder").unwrap_or_default().unwrap_or_default();
@@ -538,7 +627,15 @@ pub fn run() -> anyhow::Result<()> {
         let sidebar_width = db_lock.get_setting("sidebar_width").unwrap_or_default()
             .and_then(|s| s.parse::<f32>().ok()).filter(|w| (150.0..=500.0).contains(w));
         let favs = db_lock.get_favorites().unwrap_or_default();
-        (tracks, folder, col, asc, mode, prog, expanded_raw, sidebar_width, favs)
+        let fav_only = db_lock.get_setting("favorites_only").unwrap_or_default()
+            .map(|s| s == "true").unwrap_or(false);
+        let folder_sort = db_lock.get_setting("folder_sort").unwrap_or_default()
+            .and_then(|s| s.parse::<i32>().ok()).filter(|i| (0..=3).contains(i)).unwrap_or(0);
+        let volume = db_lock.get_setting("volume").unwrap_or_default()
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        (tracks, folder, col, asc, mode, prog, expanded_raw, sidebar_width, favs, fav_only, folder_sort, volume)
     };
 
     let restored_expanded = restore_expanded_folders(&initial_tracks, saved_expanded_raw);
@@ -566,7 +663,12 @@ pub fn run() -> anyhow::Result<()> {
         folder_search_query: String::new(),
         midi_mode: saved_mode,
         midi_program: saved_prog,
+        favorites_only: saved_fav_only,
+        folder_sort: saved_folder_sort,
+        reveal_folder: None,
     }));
+
+    sink.set_volume(saved_volume);
 
     let search_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let folder_search_generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -600,12 +702,15 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     {
-        let ui_state_guard = lock_mutex(&ui_state);
+        let mut ui_state_guard = lock_mutex(&ui_state);
         ui.set_selected_folder(SharedString::from(&ui_state_guard.selected_folder));
         ui.set_current_sort_column(SharedString::from(&ui_state_guard.sort_column));
         ui.set_current_sort_asc(ui_state_guard.sort_asc);
         ui.set_midi_mode_index(ui_state_guard.midi_mode);
         ui.set_midi_program_index(ui_state_guard.midi_program);
+        ui.set_favorites_only(ui_state_guard.favorites_only);
+        ui.set_folder_sort_index(ui_state_guard.folder_sort);
+        ui.set_volume(saved_volume);
         if let Some(w) = saved_sidebar_width {
             ui.set_sidebar_width(w);
         }
@@ -615,7 +720,7 @@ pub fn run() -> anyhow::Result<()> {
             .collect();
         ui.set_midi_program_model(slint::ModelRc::new(slint::VecModel::from(prog_model)));
 
-        update_folders_ui(&ui_weak, &ui_state_guard, &folder_search_generation);
+        update_folders_ui(&ui_weak, &mut ui_state_guard, &folder_search_generation);
         update_tracks_ui(&ui_weak, &ui_state_guard, &search_generation);
     }
 
@@ -805,7 +910,7 @@ pub fn run() -> anyhow::Result<()> {
             };
             st.all_tracks = Arc::new(tracks); // Update cache!
 
-            update_folders_ui(&ui_weak, &st, &f_gen);
+            update_folders_ui(&ui_weak, &mut st, &f_gen);
             update_tracks_ui(&ui_weak, &st, &s_gen);
 
             let status = match scan_result {
@@ -863,20 +968,27 @@ pub fn run() -> anyhow::Result<()> {
     let select_folder_search_gen = search_generation.clone();
     ui.on_select_folder(move |path| {
         let path_str = path.to_string();
+        let new_sel;
         {
             let mut st = lock_mutex(&ui_state_filter);
-            st.selected_folder = path_str.clone();
+            // Clicking the already-selected folder (or "All") deselects it,
+            // returning the track list to the unscoped view.
+            st.selected_folder = if st.selected_folder == path_str {
+                String::new()
+            } else {
+                path_str.clone()
+            };
+            new_sel = st.selected_folder.clone();
             update_tracks_ui(&ui_handle_filter, &st, &select_folder_search_gen);
         }
         if let Some(ui) = ui_handle_filter.upgrade() {
-            ui.set_selected_folder(SharedString::from(&path_str));
+            ui.set_selected_folder(SharedString::from(&new_sel));
         }
 
         let db = state_filter.db.clone();
-        let path_for_db = path_str.clone();
         std::thread::spawn(move || {
             let db_lock = lock_mutex(&db);
-            let _ = db_lock.set_setting("selected_folder", &path_for_db);
+            let _ = db_lock.set_setting("selected_folder", &new_sel);
         });
     });
 
@@ -894,7 +1006,7 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         persist_expanded_folders(state_toggle.db.clone(), st.expanded_folders.clone());
-        update_folders_ui(&ui_handle_toggle, &st, &toggle_folder_gen);
+        update_folders_ui(&ui_handle_toggle, &mut st, &toggle_folder_gen);
     });
 
     let ui_handle_search = ui_weak.clone();
@@ -929,34 +1041,17 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
 
+        // Reveal the track's folder in the sidebar tree (expand ancestors +
+        // scroll) WITHOUT touching selected_folder — playing a sample must
+        // not silently narrow the search scope to its folder.
         {
             let mut st = lock_mutex(&ui_state_play);
             let p = PathBuf::from(&path_str);
             if let Some(parent) = p.parent() {
-                let parent_str = parent.to_string_lossy().to_string();
-                if !parent_str.is_empty() {
-                    st.selected_folder = parent_str.clone();
-                    
-                    let mut curr = parent.to_path_buf();
-                    while let Some(par) = curr.parent() {
-                        if par.as_os_str().is_empty() || par.parent().is_none() {
-                            break;
-                        }
-                        st.expanded_folders.insert(par.to_string_lossy().to_string());
-                        curr = par.to_path_buf();
-                    }
-                    st.expanded_folders.insert(parent_str.clone());
-                    
+                if !parent.as_os_str().is_empty() {
+                    reveal_folder_in_tree(&mut st, parent);
                     persist_expanded_folders(state_play.db.clone(), st.expanded_folders.clone());
-                    let cur_folder = st.selected_folder.clone();
-                    update_folders_ui(&ui_handle, &st, &play_folder_gen);
-                    
-                    let ui_weak = ui_handle.clone();
-                    slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_selected_folder(SharedString::from(cur_folder));
-                        }
-                    }).ok();
+                    update_folders_ui(&ui_handle, &mut st, &play_folder_gen);
                 }
             }
         }
@@ -1337,7 +1432,7 @@ pub fn run() -> anyhow::Result<()> {
         let mut st = lock_mutex(&ui_state_folder_search);
         st.folder_search_query = query.to_string();
 
-        update_folders_ui(&ui_handle_folder_search, &st, &folder_search_gen);
+        update_folders_ui(&ui_handle_folder_search, &mut st, &folder_search_gen);
     });
 
     // MIDI channel-mode / program selections: live in UiState (read at play
@@ -1396,8 +1491,257 @@ pub fn run() -> anyhow::Result<()> {
         });
     });
 
+    let ui_state_exp = ui_state.clone();
+    let ui_handle_exp = ui_weak.clone();
+    let state_exp = state.clone();
+    let exp_folder_gen = folder_search_generation.clone();
+    ui.on_expand_all_folders(move || {
+        let mut st = lock_mutex(&ui_state_exp);
+        let (paths, _) = folder_ancestors(&st.all_tracks);
+        for p in paths {
+            st.expanded_folders.insert(p.to_string_lossy().to_string());
+        }
+        persist_expanded_folders(state_exp.db.clone(), st.expanded_folders.clone());
+        update_folders_ui(&ui_handle_exp, &mut st, &exp_folder_gen);
+    });
+
+    let ui_state_col = ui_state.clone();
+    let ui_handle_col = ui_weak.clone();
+    let state_col = state.clone();
+    let col_folder_gen = folder_search_generation.clone();
+    ui.on_collapse_all_folders(move || {
+        let mut st = lock_mutex(&ui_state_col);
+        st.expanded_folders.clear();
+        persist_expanded_folders(state_col.db.clone(), st.expanded_folders.clone());
+        update_folders_ui(&ui_handle_col, &mut st, &col_folder_gen);
+    });
+
+    let ui_state_fsort = ui_state.clone();
+    let ui_handle_fsort = ui_weak.clone();
+    let state_fsort = state.clone();
+    let fsort_folder_gen = folder_search_generation.clone();
+    ui.on_folder_sort_changed(move |index| {
+        let mut st = lock_mutex(&ui_state_fsort);
+        st.folder_sort = index.clamp(0, 3);
+        let mode = st.folder_sort;
+        let db = state_fsort.db.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("folder_sort", &mode.to_string());
+        });
+        update_folders_ui(&ui_handle_fsort, &mut st, &fsort_folder_gen);
+    });
+
+    let ui_state_ff = ui_state.clone();
+    let ui_handle_ff = ui_weak.clone();
+    let state_ff = state.clone();
+    let ff_track_gen = search_generation.clone();
+    ui.on_favorites_filter_changed(move |enabled| {
+        let mut st = lock_mutex(&ui_state_ff);
+        st.favorites_only = enabled;
+        update_tracks_ui(&ui_handle_ff, &st, &ff_track_gen);
+        let db = state_ff.db.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("favorites_only", if enabled { "true" } else { "false" });
+        });
+    });
+
+    let state_vol = state.clone();
+    ui.on_set_volume(move |v| {
+        let vol = if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 };
+        state_vol.sink.set_volume(vol);
+        let db = state_vol.db.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("volume", &vol.to_string());
+        });
+    });
+
+    let ui_state_rv = ui_state.clone();
+    let ui_handle_rv = ui_weak.clone();
+    let state_rv = state.clone();
+    let rv_folder_gen = folder_search_generation.clone();
+    ui.on_reveal_in_tree(move |path| {
+        let p = PathBuf::from(path.to_string());
+        let Some(parent) = p.parent() else { return };
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        let mut st = lock_mutex(&ui_state_rv);
+        reveal_folder_in_tree(&mut st, parent);
+        persist_expanded_folders(state_rv.db.clone(), st.expanded_folders.clone());
+        update_folders_ui(&ui_handle_rv, &mut st, &rv_folder_gen);
+    });
+
+    let ui_state_rm = ui_state.clone();
+    let ui_handle_rm = ui_weak.clone();
+    let state_rm = state.clone();
+    let rm_track_gen = search_generation.clone();
+    let rm_folder_gen = folder_search_generation.clone();
+    ui.on_remove_folder(move |path| {
+        // Deletes the folder's tracks + favorites from the library DB only;
+        // files on disk are untouched (rescanning the folder restores them).
+        let prefix = path.to_string();
+        let removed = {
+            let db = lock_mutex(&state_rm.db);
+            db.remove_under(&prefix).unwrap_or(0)
+        };
+        let tracks = {
+            let db = lock_mutex(&state_rm.db);
+            db.get_all_tracks().unwrap_or_default()
+        };
+
+        let mut st = lock_mutex(&ui_state_rm);
+        st.all_tracks = Arc::new(tracks);
+        let pp = Path::new(&prefix);
+        if !st.selected_folder.is_empty() && Path::new(&st.selected_folder).starts_with(pp) {
+            st.selected_folder.clear();
+        }
+        st.expanded_folders.retain(|f| !Path::new(f).starts_with(pp));
+        let mut favs = (*st.favorites).clone();
+        favs.retain(|f| !Path::new(f).starts_with(pp));
+        st.favorites = Arc::new(favs);
+        let cleared_sel = st.selected_folder.clone();
+
+        persist_expanded_folders(state_rm.db.clone(), st.expanded_folders.clone());
+        update_folders_ui(&ui_handle_rm, &mut st, &rm_folder_gen);
+        update_tracks_ui(&ui_handle_rm, &st, &rm_track_gen);
+        drop(st);
+
+        let db = state_rm.db.clone();
+        let sel_for_db = cleared_sel.clone();
+        std::thread::spawn(move || {
+            let db_lock = lock_mutex(&db);
+            let _ = db_lock.set_setting("selected_folder", &sel_for_db);
+        });
+
+        if let Some(ui) = ui_handle_rm.upgrade() {
+            ui.set_selected_folder(SharedString::from(&cleared_sel));
+            ui.set_status_text(SharedString::from(format!(
+                "Removed {} tracks under {} from library",
+                removed, prefix
+            )));
+        }
+    });
+
     ui.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_track(path: &str) -> Track {
+        Track {
+            id: 0,
+            path: path.to_string(),
+            mtime: 0,
+            title: None,
+            artist: None,
+            album: None,
+            genre: None,
+            duration: 1.0,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            comment: None,
+            waveform: None,
+            midi_channels: None,
+            midi_programs: None,
+            has_drums: None,
+            bpm: None,
+            musical_key: None,
+            instrument: None,
+            content_hash: None,
+        }
+    }
+
+    fn three_dir_tracks() -> Vec<Track> {
+        vec![
+            mk_track("/lib/a/x.wav"),
+            mk_track("/lib/b/y.wav"),
+            mk_track("/lib/b/z.wav"),
+            mk_track("/lib/b/sub/w.wav"),
+        ]
+    }
+
+    fn expanded_all(tracks: &[Track]) -> HashSet<String> {
+        folder_ancestors(tracks)
+            .0
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn folders_collapsed_shows_only_roots() {
+        let tracks = three_dir_tracks();
+        let items = extract_folders_hierarchical(&tracks, &HashSet::new(), "", 0);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "/lib");
+        assert!(!items[0].is_expanded);
+        assert!(items[0].has_children);
+    }
+
+    #[test]
+    fn folders_expand_reveals_children_in_order() {
+        let tracks = three_dir_tracks();
+        let mut expanded = HashSet::new();
+        expanded.insert("/lib".to_string());
+        expanded.insert("/lib/b".to_string());
+        let items = extract_folders_hierarchical(&tracks, &expanded, "", 0);
+        let names: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(names, vec!["/lib", "/lib/a", "/lib/b", "/lib/b/sub"]);
+        // "/lib/b/sub" shows because /lib/b is expanded; it has no children.
+        assert!(!items[3].has_children);
+        assert_eq!(items[3].indent, 30.0);
+    }
+
+    #[test]
+    fn folders_name_desc_sorts_siblings_only() {
+        let tracks = three_dir_tracks();
+        let expanded = expanded_all(&tracks);
+        let items = extract_folders_hierarchical(&tracks, &expanded, "", 1);
+        let names: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        // Parent stays above children; siblings order reversed.
+        assert_eq!(names, vec!["/lib", "/lib/b", "/lib/b/sub", "/lib/a"]);
+    }
+
+    #[test]
+    fn folders_count_sort() {
+        let tracks = three_dir_tracks();
+        let expanded = expanded_all(&tracks);
+        let items = extract_folders_hierarchical(&tracks, &expanded, "", 2);
+        let names: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        // /lib/b has 3 tracks, /lib/a has 1 → b first.
+        assert_eq!(names, vec!["/lib", "/lib/b", "/lib/b/sub", "/lib/a"]);
+    }
+
+    #[test]
+    fn folders_query_shows_match_with_ancestors() {
+        let tracks = three_dir_tracks();
+        let items = extract_folders_hierarchical(&tracks, &HashSet::new(), "sub", 0);
+        let names: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(names, vec!["/lib", "/lib/b", "/lib/b/sub"]);
+    }
+
+    #[test]
+    fn favorites_only_filter() {
+        let tracks = vec![
+            mk_track("/lib/a/fav.wav"),
+            mk_track("/lib/a/other.wav"),
+        ];
+        let mut favorites = HashSet::new();
+        favorites.insert("/lib/a/fav.wav".to_string());
+        let idx = get_filtered_track_indices(&tracks, "", "", "name", true, &favorites, true);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(tracks[idx[0]].path, "/lib/a/fav.wav");
+        // Filter off → both.
+        let idx = get_filtered_track_indices(&tracks, "", "", "name", true, &favorites, false);
+        assert_eq!(idx.len(), 2);
+    }
 }
 
 #[cfg(target_os = "windows")]
