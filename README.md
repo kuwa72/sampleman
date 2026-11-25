@@ -21,7 +21,7 @@ A cross-platform desktop sample/audio library manager for DTM (Desktop Music) pr
 - **Filename parsing** — extract BPM, key, and instrument from common pack naming conventions (e.g. `120BPM Am Piano Loop.wav`)
 - **Favorites** — star-toggle tracks with persistent storage
 - **Duplicate detection** — FNV-1a content-hash identifies identical files across the library
-- **Sort & filter** — by BPM, Key, Artist, Album, or favorites
+- **Sort & filter** — by name, date, duration, format, BPM, Key, or favorites (★ filter)
 
 ### MIDI
 - **Piano-roll rendering** — MIDI tracks show a piano-roll waveform in the track list
@@ -29,6 +29,9 @@ A cross-platform desktop sample/audio library manager for DTM (Desktop Music) pr
 - **MIDI seek** — seek within MIDI playback via the progress bar
 
 ### UI & UX
+- **Folder tree controls** — "All Tracks" scope reset, re-click to deselect, expand/collapse all, sibling sort (name / track count)
+- **Context menus** — right-click tracks (file manager, favorite, reveal in tree) and folders (rescan, expand/collapse, remove from library)
+- **Playback volume** — persisted volume slider
 - **Scan progress** — staged progress display (Scanning → Analyzing → Saving), cancel button, completion summary
 - **Error visibility** — walk errors and failed batches counted and surfaced in status
 - **Tree state persistence** — expanded folders and selected folder restored on relaunch
@@ -84,10 +87,9 @@ Pure-logic modules (music meta parsing, MIDI utilities) carry `#[cfg(test)]` uni
 
 | Key | Action |
 |-----|--------|
-| <Space> | Play / pause selected track |
-| Delete / Fn+Delete | Seek backward / forward 5 seconds |
-| Up / Down | Navigate track list / folders |
-| Ctrl/Cmd + F | Focus search |
+| <Space> | Play / stop selected track |
+| Enter | Play selected track |
+| Up / Down | Navigate track list (auto-plays) |
 
 ---
 

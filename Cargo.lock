@@ -4321,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "sampleman"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -4344,6 +4344,7 @@ dependencies = [
  "symphonia",
  "tokio",
  "walkdir",
+ "windows-sys 0.59.0",
  "winit",
  "winres",
 ]
